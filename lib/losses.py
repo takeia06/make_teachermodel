@@ -14,7 +14,7 @@ class SetCriterion(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
-        self.weight_dict = weight_dicta
+        self.weight_dict = weight_dict
         self.losses = losses
         self.focal_alpha = focal_alpha
 

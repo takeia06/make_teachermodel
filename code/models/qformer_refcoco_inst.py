@@ -198,9 +198,10 @@ class BertQFormer(nn.Module):
         source: str,
         num_queries_target: Optional[int] = None,
         map_location: str = "cpu",
-        prefer_ckpt_kv_dim: bool = False,
+        prefer_ckpt_kv_dim: bool = True,
     ) -> Dict[str, Any]:
         print(f"[qformer] loading pretrained from: {source}")
+        print(f"[qformer] prefer_ckpt_kv_dim={prefer_ckpt_kv_dim}")
 
         sd = None
         used_hf_loader = False
@@ -596,6 +597,29 @@ class QFormerRefCOCO(nn.Module):
                     prefer_ckpt_kv_dim=True,
                 )
                 print(f"[info] Q-Former pretrained loaded: {stats}")
+
+                # --- Debug: cross-attn Q/K ロード状態を確認 ---
+                def _stat(m):
+                    with torch.no_grad():
+                        return float(m.weight.abs().mean().item())
+
+                enc = self.qformer.bert.encoder
+                for i, layer in enumerate(enc.layer):
+                    ca = layer.crossattention.self
+                    print(f"[probe layer.{i}: |Q|={_stat(ca.quary):.6f} |K|={_stat(ca.key):.6f}")
+
+                # ---K/V実寸の強制検証 ---
+                try:
+                    expect = int(getattr(self.qformer.bert.config, "encoder_hidden_size",
+                                 getattr(self.qformer.bert.config, "cross_attention_hiddeen_size", 1408)))
+                    k0 = self.qformer.bert.encoder.layer[0].crossattention.self.key
+                    v0 = self.qformer.bert.encoder.layer[0].crossattention.self.value
+                    kin = getattr(k0, "in_features", k0.weight.shape[1])
+                    vin = getattr(v0, "in_features", v0.weight.shape[1])
+                    print(f"[sanity] cross-attn K/V in_features={kin}/{vin} (expect={expect})")
+                    assert kin == expect and vin == expect, f"cross-attn K/V in_features mismatch: {kin}/{vin} vs expect {expect}"
+                except Exception as _e:
+                    print(f"[warn] cross-attn K/V assertion skipped: {repr(_e)}")
             except Exception as e:
                 print(f"[warn] failed to load pretrained Q-Former ({pretrained_qformer}): {e}")
 
@@ -727,7 +751,7 @@ class QFormerRefCOCO(nn.Module):
         # 2) LN を実寸に合わせて張り替え（凍結のまま）
         Dv = int(tokens.size(-1))
         if (not hasattr(self, "pre_q_ln_vis")) or tuple(getattr(self.pre_q_ln_vis, "normalized_shape", ())) != (Dv,):
-            self.pre_q_ln_vis = nn.LayerNorm(Dv).to(tokens.device)
+            self.pre_q_ln_vis = nn.LayerNorm(Dv).to(tokens.device, dtype=tokens.dtype) # AMP下でもdtypeをtokensに合わせる
             self.pre_q_ln_vis.requires_grad_(False)  # ここでも明示しておく
         tokens = self.pre_q_ln_vis(tokens)
 

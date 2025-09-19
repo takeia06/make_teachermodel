@@ -905,7 +905,19 @@ def train(cfg: Dict[str, Any]):
         scheduler = build_warmup_cosine(optim, lr_warmup_steps, total_steps)
 
     # EMA（CPU/学習対象のみ）
-    ema = ModelEMA(model, decay=float(cfg.get("ema_decay", 0.999)), cpu=True, trainable_only=True)
+    ema_decay = cfg.get("ema_decay", 0.999)
+    if ema_decay is None or (isinstance(ema_datay, (int, float)) and ema_decay <= 0):
+        ema = None
+        try:
+            logger.info("[ema] disabled")
+        except Exception:
+            print("[ema] disabled")
+    else:
+        ema = ModelEMA(model, decay=float(ema_decay), cpu=True, traineble_only=True)
+        try:
+            logger.info(f"[ema] enabled (decay={float(ema_decay)})")
+        except Exception:
+            print(f"[ema] enabled (decay={float(ema_decay)})")
 
     # ------- 再開学習（統合版） -------
     global_step = _maybe_resume(model, optim, scheduler, scaler, ema, cfg)
@@ -1106,7 +1118,9 @@ def train(cfg: Dict[str, Any]):
 
             # スケジューラ & EMA
             scheduler.step()
-            ema.update(model)
+            # ---EMA update (guard) ----
+            if ema is not None:
+                ema.update(model)
 
             running += float(loss.item())
             global_step += 1

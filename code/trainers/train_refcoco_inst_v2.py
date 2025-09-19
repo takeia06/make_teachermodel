@@ -806,6 +806,9 @@ def train(cfg: Dict[str, Any]):
 
     # Data
     dl_tr, dl_va = build_loaders(cfg)
+    print("[debug] cfg.train.max_steps = ", cfg.get("train", {}).get("max_steps"))
+    print("[debug] cfg.train.max_steps_per_epoch =", cfg.get("train", {}).get("max_steps_per_epoch"))
+    print("[debug] len(dl_tr) =", len(dl_tr), "| len(dl_va) =", len(dl_va))
 
     # 入力解像度（ViT/14 のパッチ解像に直結）を YAML に合わせて統一
     long_side = int(cfg.get("dataset", {}).get("long_side", 896))
@@ -844,6 +847,14 @@ def train(cfg: Dict[str, Any]):
     # --- max_steps（0 なら無効）---
     max_steps = int(cfg.get("train", {}).get("max_steps", 0))
     len_tr = max(1, len(dl_tr))
+
+    if max_steps > 0 and epochs * len_tr < max_steps:
+        prev_epochs = epochs
+        epochs = math.ceil(max_steps / len_tr)
+        print(
+            f"[train] epochs adjusted: {prov_epoches} -> {epochs} "
+            f"to satisfy max_steps={max_steps} (len_tr={len_tr})"
+        )
     # --- per-epoch 上限（0 なら無効）---
     max_steps_per_epoch = int(cfg.get("train", {}).get("max_steps_per_epoch", 0))
 
@@ -927,6 +938,10 @@ def train(cfg: Dict[str, Any]):
         iter_ema_sec, iter_ema_ips = None, None
 
         for it, batch in enumerate(dl_tr, start=1):
+            if it in (1, 50, 100, 101):
+                print(f"[debug: ep={ep} it={it} gs={global_step} |"
+                      f"path0={batch.get('path', [' '])[0]}")
+
             iter_t0 = time.perf_counter()
             if overfit_1b:
                 if fixed_batch is None:
@@ -1129,6 +1144,7 @@ def train(cfg: Dict[str, Any]):
 
             # ===== max_steps 到達チェック =====
             if max_steps > 0 and global_step >= max_steps:
+                print(f"[debug] hit max_steps at gs={global_step} (cfg={max_steps}")
                 print(f"[train] Reached max_steps={max_steps} (global_step={global_step}). Stopping training.")
                 reached_max = True
                 # ここではbreakし、下の保存や評価へ
@@ -1136,6 +1152,7 @@ def train(cfg: Dict[str, Any]):
 
             # ===== 1エポック上限 =====
             if max_steps_per_epoch > 0 and it >= max_steps_per_epoch:
+                print(f"[debug] hit max_steps_per_epoch at it={it} (cfg={max_steps_per_epoch})")
                 print(f"[train] Reached max_steps_per_epoch={max_steps_per_epoch} at epoch {ep}.")
                 break
 
@@ -1153,7 +1170,10 @@ def train(cfg: Dict[str, Any]):
                     thr = torch.quantile(flat, q=q, dim=1, keepdim=True).view(B,1,1,1)
                     pred = (probs >= thr).float()
                     inter = (pred * gt).sum(dim=(2, 3))
-                    union = (pred + gt - pred * gt).sum(dim=(2, 3)) + 1e-6
+                    union = (pred + gt - pred * gt).sum(dim=(
+
+
+2, 3)) + 1e-6
                     iou_qs[f"iou_p{int(q*100)}"] = (inter / union).mean().item()
 
                 pred_05 = (probs >= 0.5).float()

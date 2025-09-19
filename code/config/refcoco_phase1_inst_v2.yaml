@@ -1,0 +1,141 @@
+out_dir: /home/takei/AnomalyGPT/outputs/refcoco_phase1p_vision
+resume: ""
+resume_full: full
+save_every_steps: 0
+num_workers: 0
+pin_memory: false
+ema_decay: 0.999   # ← 仕上げの安定寄り（trainerはCPU EMA）
+
+# 追加：部分解凍の度合いと Vision 用LR
+vision_unfreeze_blocks: 2     # 末尾からNブロックを解凍（2〜4推奨）
+lr_vision: 3.0e-6             # Visionの極小LR（AdamW param groupで使用）
+
+train:
+  batch_size: 1
+  epochs: 1
+  amp: true
+  save_attn_vis: false
+  save_every: 800
+  log_interval: 1
+  optimizer: "adamw"
+  scheduler: "cosine"    # ← trainer側は lr_warmup_steps 
+  warmup_steps: 0        # ← メモ用（lr_warmup_steps が実際に参照される）
+  max_steps_per_epoch: 0
+  max_steps: 35
+  
+
+# SGDRを選ぶ場合に使用（scheduler: "sgdr" のときだけ）
+sgdr:
+  t0: 2
+  t_mult: 2
+  eta_min: 1.0e-6
+
+use_amp: true
+use_fp16: false          # bf16/AMP前提。必要ならtrueに
+
+# 層別LR（安定寄り）
+lr_head: 3.0e-4
+lr_q_kv: 2.0e-4
+lr_q_last: 5.0e-4
+wd_head: 0.0
+wd_body: 0.01
+lr_warmup_steps: 300    # ← 実際に使われるwarmupステップ
+
+# 追加（任意）：focal係数を明示（trainerは無指定時に内部既定あり）
+focal:
+  w0: 0.0
+  w1: 0.0
+  decay_steps: 150
+
+# 追加（任意）：MixUpを明示（Phase1では通常0でOK）
+mixup_prob: 0.0
+mixup_alpha: 0.2
+
+model:
+  pretrained_qformer: "/home/takei/AnomalyGPT/pretrained_qformer/instruct_qformer_only.pth"
+  openclip_name: ViT-g-14
+  openclip_pretrained: laion2b_s34b_b88k
+  llm_name: "/home/takei/AnomalyGPT/pretrained_ckpt/vicuna_ckpt/7b_v1.5"
+  load_vicuna: true
+  max_txt_len: 128
+  num_queries: 16
+  proj_dim_in: 768
+  proj_dim_out: 4096
+  encoder_hidden_size: 1408     # ← Q-Former cross-attn K/V想定次元（instruct系に合わせる）
+  text_cond_mode: "bias+kv"     # "bias" or "bias+kv"
+  num_text_kv: 4                # bias+kv時のみ有効（保守のため残しておく）
+  patch: 14
+  max_alpha: 0.85
+
+loss_weights:
+  attn: 0.70                    # ← わずかに下げてbox寄り
+  box: 1.6
+  contrast: 0.0
+  lm: 0.0
+
+aux_loss:
+  soft_iou_w: 0.1
+  lovasz_w: 0.2
+  edge_bce_w: 0.0
+  tv_w: 0.0
+
+# Box重みのウォームアップ（trainer内でw_boxに反映）
+box_warmup_steps: 1500
+box_target_weight: 0.5          # ← 仕上げでは0.5〜0.8の間で安定を見つつ
+
+contrast:
+  temperature: 0.07
+  w0: 0.02
+  w1: 0.10
+  warmup_steps: 1500
+  ramp_steps: 2000
+
+dataset:
+  train_json:
+    - /home/takei/data/refcoco_data/refcoco_json/refcoco/RefCOCO_train_aug.json
+    - /home/takei/data/refcoco_data/refcoco_json/refcocopp/RefCOCOplus_train_aug.json
+    - /home/takei/data/refcoco_data/refcoco_json/refcocog/RefCOCOg_train_aug.json
+  val_json:
+    - /home/takei/data/refcoco_data/refcoco_json/refcoco/RefCOCO_val_aug.json
+    - /home/takei/data/refcoco_data/refcoco_json/refcocopp/RefCOCOplus_val_aug.json
+    - /home/takei/data/refcoco_data/refcoco_json/refcocog/RefCOCOg_val_aug.json
+  img_root:
+    train2014: /home/takei/data/refcoco_data/train2014
+    val2014:   /home/takei/data/refcoco_data/val2014
+    default:   /home/takei/data/refcoco_data
+  supervision: mask
+  long_side: 1008               # ← 学習/評価とも trainer 側でこの正方に統一
+  split: train
+  use_answers: expand
+  answer_key: answer
+  text_key: text
+  val_answer_mode: first
+  augment:
+    flip: false
+    color_jitter: false
+    color_jitter_params:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.05
+    random_resized_crop:
+      enabled: false 
+
+eval:
+  quantile_p: 0.70
+  quantile_p0: 0.90
+
+debug:
+  sanity_steps: 300
+  sanity_every: 0
+  grad_clip: 1.0
+  overfit_one_batch: true
+  skip_val: true
+
+logging:
+  tensorboard: true
+
+early_stop:
+  metric: "val_iou_05"
+  patience: 9
+

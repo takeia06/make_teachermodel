@@ -4,10 +4,10 @@ resume_full: full
 save_every_steps: 0
 num_workers: 0
 pin_memory: false
-ema_decay: 0.999   # ← 仕上げの安定寄り（trainerはCPU EMA）
+ema_decay:   # ← 仕上げの安定寄り（trainerはCPU EMA）
 
 # 追加：部分解凍の度合いと Vision 用LR
-vision_unfreeze_blocks: 2     # 末尾からNブロックを解凍（2〜4推奨）
+vision_unfreeze_blocks: 0     # 末尾からNブロックを解凍（2〜4推奨）
 lr_vision: 3.0e-6             # Visionの極小LR（AdamW param groupで使用）
 
 train:
@@ -18,11 +18,10 @@ train:
   save_every: 800
   log_interval: 1
   optimizer: "adamw"
-  scheduler: "cosine"    # ← trainer側は lr_warmup_steps 
+  scheduler: "constant"    # ← trainer側は lr_warmup_steps 
   warmup_steps: 0        # ← メモ用（lr_warmup_steps が実際に参照される）
   max_steps_per_epoch: 0
-  max_steps: 35
-  
+  max_steps: 1500
 
 # SGDRを選ぶ場合に使用（scheduler: "sgdr" のときだけ）
 sgdr:
@@ -34,12 +33,12 @@ use_amp: true
 use_fp16: false          # bf16/AMP前提。必要ならtrueに
 
 # 層別LR（安定寄り）
-lr_head: 3.0e-4
+lr_head: 2.0e-3
 lr_q_kv: 2.0e-4
-lr_q_last: 5.0e-4
+lr_q_last: 8.0e-4
 wd_head: 0.0
-wd_body: 0.01
-lr_warmup_steps: 300    # ← 実際に使われるwarmupステップ
+wd_body: 0.0
+lr_warmup_steps: 0  # ← 実際に使われるwarmupステップ
 
 # 追加（任意）：focal係数を明示（trainerは無指定時に内部既定あり）
 focal:
@@ -68,8 +67,8 @@ model:
   max_alpha: 0.85
 
 loss_weights:
-  attn: 0.70                    # ← わずかに下げてbox寄り
-  box: 1.6
+  attn: 1.0                    # ← わずかに下げてbox寄り
+  box: 0.0
   contrast: 0.0
   lm: 0.0
 
@@ -80,7 +79,7 @@ aux_loss:
   tv_w: 0.0
 
 # Box重みのウォームアップ（trainer内でw_boxに反映）
-box_warmup_steps: 1500
+box_warmup_steps: 0
 box_target_weight: 0.5          # ← 仕上げでは0.5〜0.8の間で安定を見つつ
 
 contrast:

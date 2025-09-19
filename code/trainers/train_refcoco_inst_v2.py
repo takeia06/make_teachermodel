@@ -21,13 +21,10 @@ from torchvision import transforms
 # =======================
 # モデル本体（修正後を利用）
 # =======================
-"""try:
-    # 新ファイル名（v2）を優先
-    from models.qformer_refcoco_inst_v2 import QFormerRefCOCO, OpenCLIPVisionFrozen
-except Exception:
-    # 互換: もし v2 が無ければ旧名を使う
-    from models.qformer_refcoco_inst import QFormerRefCOCO, OpenCLIPVisionFrozen
-"""
+# try:
+#     from models.qformer_refcoco_inst_v2 import QFormerRefCOCO, OpenCLIPVisionFrozen
+# except Exception:
+#     from models.qformer_refcoco_inst import QFormerRefCOCO, OpenCLIPVisionFrozen
 from models.qformer_refcoco_inst import QFormerRefCOCO, OpenCLIPVisionFrozen
 
 # =========================================================
@@ -60,7 +57,7 @@ def soft_iou_loss(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -
     union = (prob + target - prob * target).sum(dim=(2, 3)) + eps
     return (1.0 - inter / union).mean()
 
-# == 既存: soft_iou_loss の直後に追加 ==
+# == Lovasz
 def lovasz_grad(gt_sorted):
     p = len(gt_sorted)
     gts = gt_sorted.sum()
@@ -72,7 +69,6 @@ def lovasz_grad(gt_sorted):
     return jaccard
 
 def lovasz_hinge_flat(logits, labels):
-    # logits: (N,), labels: {0,1} (N,)
     if logits.numel() == 0:
         return logits.sum() * 0.
     signs = 2. * labels - 1.
@@ -90,11 +86,9 @@ def lovasz_sigmoid(prob, target):
     for b in range(B):
         p = prob[b].view(-1)
         t = target[b].view(-1)
-        # logit近似
         logit = torch.log(p.clamp(1e-6,1-1e-6)) - torch.log1p(-p.clamp(1e-6,1-1e-6))
         loss = loss + lovasz_hinge_flat(logit, t)
     return loss / B
-
 
 class InfoNCELoss(nn.Module):
     def __init__(self, temperature: float = 0.07):
@@ -323,8 +317,7 @@ def refcoco_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         if img is None: continue
         _, H, W = img.shape
         Hmax = max(Hmax, H); Wmax = max(Wmax, W)
- 
-    # 目標を 14 の倍数に切り上げ（conv1のタイル割り切りを保証）
+
     def _ceil_to_m(x, m): return ((x + m - 1) // m) * m
     Hmax = _ceil_to_m(Hmax, PATCH)
     Wmax = _ceil_to_m(Wmax, PATCH)
@@ -394,7 +387,6 @@ def _ensure_dir(p: str):
 
 def _mask_to_feat_hw(sm: torch.Tensor, feat_hw: Tuple[int, int]) -> torch.Tensor:
     Ht, Wt = int(feat_hw[0]), int(feat_hw[1])
-    # 最近傍はソフト性を殺すのでbilinearへ
     out = F.interpolate(sm, size=(Ht, Wt), mode="bilinear", align_corners=False)
     return out.clamp(0, 1)
 
@@ -542,9 +534,8 @@ def build_model(cfg: Dict[str, Any], device: torch.device) -> nn.Module:
 
     vision = None
     try:
-        # === ViT-g/14 に統一（ckpt の K/V=1408 に合わせる）===
-        oc_name = mcfg.get("openclip_name", "ViT-g-14")                 # YAMLで上書き可
-        oc_pt   = mcfg.get("openclip_pretrained", "laion2b_s34b_b88k")  # 同上
+        oc_name = mcfg.get("openclip_name", "ViT-g-14")
+        oc_pt   = mcfg.get("openclip_pretrained", "laion2b_s34b_b88k")
         print(f"[info] Using OpenCLIP {oc_name} ({oc_pt}).")
         vision = OpenCLIPVisionFrozen(model_name=oc_name, pretrained=oc_pt).to(device).eval()
     except Exception as e:
@@ -552,8 +543,6 @@ def build_model(cfg: Dict[str, Any], device: torch.device) -> nn.Module:
         print("  reason:", repr(e))
         vision = TinyFrozenConvVision(out_dim=proj_dim_in, patch=int(mcfg.get("patch", 16))).to(device).eval()
 
-    # enc_kv_dim は YAML の encoder_hidden_size に従う
-    # （OpenCLIP 1024 -> (線形) -> 1408 で Q-Former へ渡す構成にも対応）
     enc_kv_dim = int(mcfg.get("encoder_hidden_size", 1408))
 
     model = QFormerRefCOCO(
@@ -570,7 +559,6 @@ def build_model(cfg: Dict[str, Any], device: torch.device) -> nn.Module:
         num_text_kv=int(mcfg.get("num_text_kv", 0)),
         qformer_kv_dim=enc_kv_dim,
     ).to(device)
-    # --- optional: Q-Former のメモリ削減＆安定化（対応していれば有効化） ---
     try:
         if hasattr(model, "qformer") and hasattr(model.qformer, "bert"):
             model.qformer.bert.gradient_checkpointing_enable()
@@ -616,14 +604,11 @@ def build_optimizer(model: nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optimi
             for n, p in blk.named_parameters():
                 p.requires_grad = True
                 pg_vision.append(p)
-        # pos/ln も少しだけ動かすと安定するケースあり
         visual = getattr(getattr(vis, "model", vis), "visual", None)
-        # positional_embedding は Parameter 本体
         pe = getattr(visual, "positional_embedding", None)
         if isinstance(pe, torch.nn.Parameter):
             pe.requires_grad = True
             pg_vision.append(pe)
-        # ln_pre は LayerNorm。内部パラメータを学習対象へ
         ln_pre = getattr(visual, "ln_pre", None)
         if isinstance(ln_pre, nn.LayerNorm):
             for p in ln_pre.parameters():
@@ -633,7 +618,6 @@ def build_optimizer(model: nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optimi
         print("[warn] vision unfreeze skipped:", repr(e))
 
     for n, p in model.named_parameters():
-        # 射影やクエリエンベなどヘッド類
         if any(k in n for k in ["projector", "projector_text", "token_proj", "query_gate", "logit_tau", "logit_bias",
                                 "vis_proj", "query_embed", "pre_q_ln",
                                 "_vis_adapter", "sim_proj", "text_kv_proj"]):
@@ -641,14 +625,12 @@ def build_optimizer(model: nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optimi
             pg_head.append(p)
             continue
 
-        # Q-Former の最終2層の cross-attn K/V
         if any(f".layer.{i}." in n for i in target_layers):
             if ".crossattention." in n and (".key." in n or ".value." in n):
                 p.requires_grad = True
                 pg_q_kv.append(p)
                 continue
 
-        # 最終層の self-attn の一部（軽め）
         if (f".layer.{last_idx}." in n) and (".attention.self." in n) and (".query." in n or ".output.dense." in n):
             p.requires_grad = True
             pg_q_last.append(p)
@@ -680,11 +662,11 @@ def build_optimizer(model: nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optimi
     print(f"[sanity] pg_head={len(pg_head)} | pg_q_last={len(pg_q_last)} | pg_q_kv={len(pg_q_kv)} | pg_vision={len(pg_vision)}")
     return optim
 
+# ---- 安全CSV追記 ----
 def _csv_append(path: str, row: dict, field_order: list):
     is_new = not os.path.exists(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", newline="") as f:
-        # 既知フィールドのみ書く（余分なキーは無視して安全に追記）
         writer = csv.DictWriter(f, fieldnames=field_order)
         if is_new:
             writer.writeheader()
@@ -708,12 +690,10 @@ def build_warmup_cosine(optimizer, warmup_steps: int, total_steps: int):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-# === 既存 build_warmup_cosine の直後に追加 ===
 def build_sgdr(optimizer, t0: int = 2, t_mult: int = 2, eta_min: float = 1e-6):
     return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=t0, T_mult=t_mult, eta_min=eta_min
     )
-
 
 # =========================================================
 # seed 固定
@@ -744,10 +724,8 @@ def _maybe_resume(model, optim, scheduler, scaler, ema, cfg) -> int:
         missing, unexpected = model.load_state_dict(sd, strict=False)
         if missing:   print("[resume] missing keys:", len(missing))
         if unexpected:print("[resume] unexpected keys:", len(unexpected))
-        # safetensors は重みのみ。resume_full は意味が無い
         return 0
 
-    # .pt 系
     ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
     sd = ckpt.get("model", ckpt)
     missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -766,13 +744,33 @@ def _maybe_resume(model, optim, scheduler, scaler, ema, cfg) -> int:
             try: scaler.load_state_dict(ckpt["scaler"])
             except Exception as e: print("[resume] scaler.load_state_dict failed:", repr(e))
         if "ema" in ckpt and isinstance(ckpt["ema"], dict) and (ema is not None):
-            # EMA は CPU 保持が安全
             ema.ema = {k: (v.to("cpu") if torch.is_tensor(v) else v) for k, v in ckpt["ema"].items()}
         global_step = int(ckpt.get("global_step", 0))
         print("[resume] optimizer/scheduler/scaler/ema restored; global_step =", global_step)
 
     return global_step
 
+# =========================================================
+# スイッチ（重みON/OFF切替ランプ）
+# =========================================================
+def _ramp(step: int, on_step: Optional[int], ramp_steps: int, start: float, target: float) -> float:
+    if on_step is None:
+        return target
+    if step < on_step:
+        return start
+    if ramp_steps <= 0:
+        return target
+    t = min(1.0, max(0.0, (step - on_step) / float(max(1, ramp_steps))))
+    return start + (target - start) * t
+
+def _gate_from_cfg(step: int, sw: Optional[dict], default: float = 1.0) -> float:
+    if not isinstance(sw, dict):
+        return default
+    on_step = sw.get("on_step", None)
+    ramp = int(sw.get("ramp_steps", 0))
+    start = float(sw.get("start", default))
+    target = float(sw.get("target", default))
+    return _ramp(step, on_step, ramp, start, target)
 # =========================================================
 # 学習本体
 # =========================================================
@@ -786,10 +784,9 @@ def train(cfg: Dict[str, Any]):
     sanity_every = int(dbg_cfg.get("sanity_every", 0))
     skip_val = bool(dbg_cfg.get("skip_val", False))
 
-    # まず out_dir を決める
+    # out_dir
     out_dir = cfg.get("out_dir", cfg.get("train", {}).get("out_dir", "./outputs_refcoco"))
-    os.makedirs(os.path.join(out_dir, "checkpoints"), exist_ok=True
-    )
+    os.makedirs(os.path.join(out_dir, "checkpoints"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "attn_vis"), exist_ok=True)
 
     from torch.utils.tensorboard import SummaryWriter
@@ -845,12 +842,10 @@ def train(cfg: Dict[str, Any]):
     log_interval = int(cfg.get("log_interval", tc.get("log_interval", 50)))
 
     # --- max_steps（0 なら無効）---
-    # train.max_steps を優先的に使用し、LR スケジューラや ETA 計算にも反映
     max_steps = int(cfg.get("train", {}).get("max_steps", 0))
     len_tr = max(1, len(dl_tr))
     # --- per-epoch 上限（0 なら無効）---
     max_steps_per_epoch = int(cfg.get("train", {}).get("max_steps_per_epoch", 0))
-
 
     # 損失重み
     lw = cfg.get("loss_weights", {"attn":0.5, "box":1.5, "contrast":0.0, "lm":0.0})
@@ -869,7 +864,6 @@ def train(cfg: Dict[str, Any]):
 
     # 評価設定
     eval_q1 = float(cfg.get("eval", {}).get("quantile_p", 0.85))
-    eval_q0 = float(cfg.get("eval", {}).get("quantile_p0", 0.90))
     iou_col = f"iou_p{int(round(eval_q1*100))}"
 
     best_val = float("inf")
@@ -881,17 +875,10 @@ def train(cfg: Dict[str, Any]):
     warm_steps = int(cfg.get("box_warmup_steps", 1000))
     box_target = float(cfg.get("box_target_weight", 0.8))
 
-    var_reg_w = 0.0
-
     # LR Scheduler
-    total_steps_cfg = epochs * len_tr
+    total_steps = epochs * len_tr
     if max_steps > 0:
-        total_steps_cfg = min(total_steps_cfg, max_steps)
-    total_steps = total_steps_cfg
-    total_steps_cfg = epochs * len_tr
-    if max_steps > 0:
-        total_steps_cfg = min(total_steps_cfg, max_steps)
-    total_steps = total_steps_cfg
+        total_steps = min(total_steps, max_steps)
     lr_warmup_steps = int(cfg.get("lr_warmup_steps", 1000))
     lr_warmup_steps = min(lr_warmup_steps, max(1, total_steps // 2))
     sched_name = str(cfg.get("train", {}).get("scheduler", "cosine")).lower()
@@ -902,7 +889,6 @@ def train(cfg: Dict[str, Any]):
         eta_min = float(sgdr_cfg.get("eta_min", 1e-6))
         scheduler = build_sgdr(optim, t0=t0, t_mult=t_mult, eta_min=eta_min)
     elif sched_name == "constant":
-        # 学習率を完全に一定にする
         scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lambda step: 1.0)
     else:
         scheduler = build_warmup_cosine(optim, lr_warmup_steps, total_steps)
@@ -911,20 +897,14 @@ def train(cfg: Dict[str, Any]):
 
     # EMA（CPU/学習対象のみ）
     ema_decay = cfg.get("ema_decay", 0.999)
-    if (ema_decay is None) or (isinstance(ema_datay, (int, float)) and float(ema_decay) <= 0):
+    if (ema_decay is None) or (isinstance(ema_decay, (int, float)) and float(ema_decay) <= 0):
         ema = None
-        try:
-            logger.info("[ema] disabled")
-        except Exception:
-            print("[ema] disabled")
+        print("[ema] disabled")
     else:
-        ema = ModelEMA(model, decay=float(ema_decay), cpu=True, traineble_only=True)
-        try:
-            logger.info(f"[ema] enabled (decay={float(ema_decay)})")
-        except Exception:
-            print(f"[ema] enabled (decay={float(ema_decay)})")
+        ema = ModelEMA(model, decay=float(ema_decay), cpu=True, trainable_only=True)
+        print(f"[ema] enabled (decay={float(ema_decay)})")
 
-    # ------- 再開学習（統合版） -------
+    # 再開
     global_step = _maybe_resume(model, optim, scheduler, scaler, ema, cfg)
 
     overfit_1b = bool(cfg.get("debug", {}).get("overfit_one_batch", False))
@@ -999,7 +979,6 @@ def train(cfg: Dict[str, Any]):
                     if use_amp: scaler.update()
                     optim.zero_grad(set_to_none=True)
                     continue
-
                 sm_hw = _mask_to_feat_hw(soft, (Ht, Wt)).clamp(0.0, 1.0)
 
                 # ===== 1) L_attn =====
@@ -1016,7 +995,7 @@ def train(cfg: Dict[str, Any]):
                 S_soft     = (0.7 * S32 + 0.3 * S_blur).clamp(0.0, 1.0)
                 loss_box_dice = safe_dice_from_probs(A_prob_hw, S_soft)
                 loss_box_bce  = safe_bce_from_probs(A_prob_hw, S_soft)
-                loss_box_val  = 1.5 * loss_box_dice + 0.5 * loss_box_bce  # 必要なら係数を調整
+                loss_box_val  = 1.5 * loss_box_dice + 0.5 * loss_box_bce
 
                 # ===== 2.5) Soft-IoU =====
                 loss_iou = soft_iou_loss(A_prob_hw, S_soft) if soft_iou_w > 0 else torch.tensor(0.0, device=images.device)
@@ -1049,12 +1028,15 @@ def train(cfg: Dict[str, Any]):
                 bce_edge = F.binary_cross_entropy_with_logits(A_logit_hw, S_soft, weight=(1.0 + 2.0 * ew), reduction="mean")
                 tv_val   = total_variation(A_prob_hw)
 
-                # ------- 係数 -------
+                # ------- 係数（box warmup + スイッチゲート） -------
                 t_w   = min(1.0, (global_step) / max(1, warm_steps))
-                w_box = box_target * t_w
-                var_reg   = (-A_logit_hw.var(dim=(2, 3)).mean()) * 0.0
-                lm_scale  = (min(1.0, (global_step) / max(1, lm_warmup)) if lw.get("lm", 0.0) > 0 else 0.0)
+                w_box_base = box_target * t_w  # 0 -> box_target
+                # switch（任意）
+                switch = cfg.get("switch", {})
+                attn_gate = _gate_from_cfg(global_step, switch.get("attn"), default=1.0)
+                box_gate  = _gate_from_cfg(global_step, switch.get("box"),  default=1.0)
 
+                # 動的係数
                 focal_cfg         = cfg.get("focal", {})
                 focal_w0          = float(focal_cfg.get("w0", 0.30))
                 focal_w1          = float(focal_cfg.get("w1", 0.10))
@@ -1082,14 +1064,17 @@ def train(cfg: Dict[str, Any]):
                 loss_lovasz = lovasz_sigmoid(A_prob_hw, S_soft) if lovasz_w_eff > 0 else torch.tensor(0.0, device=images.device)
 
                 # ------- 合算ロス -------
-                loss = (lw.get("attn", 0.5) * loss_attn_val +
-                        w_box * lw.get("box", 1.5) * loss_box_val +
-                        ctr_coeff * loss_ctr_val +
+                attn_coeff = lw.get("attn", 0.5) * attn_gate
+                box_coeff  = lw.get("box", 1.5) * w_box_base * box_gate
+                lm_scale  = (min(1.0, (global_step) / max(1, lm_warmup)) if lw.get("lm", 0.0) > 0 else 0.0)
+
+                loss = (attn_coeff * loss_attn_val +
+                        box_coeff  * loss_box_val +
+                        ctr_coeff  * loss_ctr_val +
                         (lw.get("lm", 0.0) * lm_scale) * loss_lm_val +
-                        var_reg +
                         focal_coeff * focal_loss +
                         soft_iou_w * loss_iou +
-                        lovasz_w_eff * loss_lovasz +  
+                        lovasz_w_eff * loss_lovasz +
                         edge_bce_w * bce_edge +
                         tv_w * tv_val)
 
@@ -1098,7 +1083,6 @@ def train(cfg: Dict[str, Any]):
                     if use_amp: scaler.update()
                     optim.zero_grad(set_to_none=True)
                     continue
-
             # ===== backward / step =====
             if use_amp:
                 scaler.scale(loss).backward()
@@ -1123,7 +1107,6 @@ def train(cfg: Dict[str, Any]):
 
             # スケジューラ & EMA
             scheduler.step()
-            # ---EMA update (guard) ----
             if ema is not None:
                 ema.update(model)
 
@@ -1134,31 +1117,27 @@ def train(cfg: Dict[str, Any]):
             iter_sec = max(1e-9, time.perf_counter() - iter_t0)
             imgs = int(images.size(0))
             ips = imgs / iter_sec
-            # per-epoch EMA
             iter_ema_sec = iter_sec if iter_ema_sec is None else (0.9 * iter_ema_sec + 0.1 * iter_sec)
             iter_ema_ips = ips      if iter_ema_ips is None else (0.9 * iter_ema_ips + 0.1 * ips)
-            # global EMA
             total_iter_ema_sec = iter_sec if total_iter_ema_sec is None else (0.99 * total_iter_ema_sec + 0.01 * iter_sec)
             total_iter_ema_ips = ips      if total_iter_ema_ips is None else (0.99 * total_iter_ema_ips + 0.01 * ips)
-            # ETA
             steps_left_epoch = max(0, len(dl_tr) - it)
             eta_epoch_sec = (iter_ema_sec or iter_sec) * steps_left_epoch
-            total_steps_all = (max_steps if max_steps > 0 else (epochs * len_tr))
             total_steps_all = (max_steps if max_steps > 0 else (epochs * len_tr))
             steps_done = (ep - 1) * max(1, len(dl_tr)) + it
             eta_total_sec = (total_iter_ema_sec or iter_sec) * max(0, total_steps_all - steps_done)
 
-            # ===== max_steps 到達チェック（この時点で即終了） =====
+            # ===== max_steps 到達チェック =====
             if max_steps > 0 and global_step >= max_steps:
                 print(f"[train] Reached max_steps={max_steps} (global_step={global_step}). Stopping training.")
                 reached_max = True
+                # ここではbreakし、下の保存や評価へ
                 break
 
-            # ===== 1エポック当たりの上限に達したら、このエポックを終了 =====
+            # ===== 1エポック上限 =====
             if max_steps_per_epoch > 0 and it >= max_steps_per_epoch:
                 print(f"[train] Reached max_steps_per_epoch={max_steps_per_epoch} at epoch {ep}.")
                 break
- 
 
             # ===== メトリクス =====
             with torch.no_grad():
@@ -1168,7 +1147,6 @@ def train(cfg: Dict[str, Any]):
                 B, _, Ht_, Wt_ = probs.shape
                 flat = probs.view(B, -1)
 
-                # 複数quantileで観測
                 qs = [0.70, 0.80, 0.90]
                 iou_qs = {}
                 for q in qs:
@@ -1201,7 +1179,7 @@ def train(cfg: Dict[str, Any]):
                 neg_mean = float(probs[gt < 0.5].mean().item()) if (gt < 0.5).any() else float('nan')
 
             if it % log_interval == 0:
-                # --- ② 可視化（インデント修正 & ロバスト化） ---
+                # 可視化
                 if cfg.get("train", {}).get("save_attn_vis", True) and (it % (log_interval * 2) == 0):
                     try:
                         import torchvision.utils as vutils
@@ -1219,14 +1197,13 @@ def train(cfg: Dict[str, Any]):
                     "box":  round(float(loss_box_val.item()), 6),
                     "ctr":  round(float(loss_ctr_val.item()), 6),
                     "lm":   round(float(loss_lm_val.item()), 6),
-                    "box_w": round(float(w_box), 6),
+                    "box_w": round(float(w_box_base), 6),
                     "iou_05": round(float(iou_05), 6),
                     "iou_size": round(float(iou_sz), 6),
                     "pos_mean": round(float(pos_mean), 6),
                     "neg_mean": round(float(neg_mean), 6),
                     "p_cur": round(float(eval_q1), 4),
                 }
-                # 追加: p70/p80/p90 をCSV/TBへ
                 for k, v in iou_qs.items():
                     base_row[k] = round(float(v), 6)
 
@@ -1242,11 +1219,12 @@ def train(cfg: Dict[str, Any]):
                 writer.add_scalar("train/iou@p90", float(iou_qs["iou_p90"]), global_step)
                 writer.add_scalar("train/iou@0.5", float(iou_05), global_step)
                 writer.add_scalar("train/iou@size", float(iou_sz), global_step)
-                writer.add_scalar("lr", float(scheduler.get_last_lr()[0]), global_step)
+                try:
+                    writer.add_scalar("lr", float(scheduler.get_last_lr()[0]), global_step)
+                except Exception:
+                    writer.add_scalar("lr", float(optim.param_groups[0]["lr"]), global_step)
                 writer.add_scalar("train/gt_pos_ratio", float((sm_hw>0.5).float().mean().item()), global_step)
 
-
-                # 速度・ETAをbase_rowに統合して1回だけかく
                 row = {
                     **base_row,
                     "sec_per_iter": round(float(iter_ema_sec or iter_sec), 6),
@@ -1265,16 +1243,16 @@ def train(cfg: Dict[str, Any]):
 
                 running = 0.0
 
-                # --- コンソールは“要点だけ”の一行表示 ---
+                # コンソール
                 if console_compact:
                     if it == 1 or (it % max(50, log_interval*10) == 1):
-                        print("epoch¥titer¥tags^tloss¥tiou@0.5¥tpos¥tneg¥tlr¥tips")
+                        print("epoch\titer\tgs\tloss\tiou@0.5\tpos\tneg\tlr\tips")
                     try:
                         cur_lr = float(scheduler.get_last_lr()[0])
                     except Exception:
                         cur_lr = optim.param_groups[0]["lr"]
-                    print(f"{ep}¥t{it}¥t{global_step}¥t"
-                          f"{avg_loss:.4f}¥t{iou_05:.3f}¥t{pos_mean:.3f}¥t{neg_mean:.3f}¥t{cur_lr:.2e}¥t{(iter_ema_ips or ips):.2f}")
+                    print(f"{ep}\t{it}\t{global_step}\t"
+                          f"{avg_loss:.4f}\t{iou_05:.3f}\t{pos_mean:.3f}\t{neg_mean:.3f}\t{cur_lr:.2e}\t{(iter_ema_ips or ips):.2f}")
 
             # ===== mid-epoch 保存（軽量） =====
             save_every_steps = int(cfg.get("save_every_steps", 0))
@@ -1296,42 +1274,33 @@ def train(cfg: Dict[str, Any]):
                     except Exception as e:
                         print("[warn] safetensors mid-save failed:", repr(e))
 
-        # ========= VALIDATION（EMA重みで） =========
-        # --- max_steps に到達していれば、検証をスキップして全体ループを抜ける ---
+        # ========= VALIDATION/終了処理 =========
         if reached_max:
-            break
+            # このエポックの保存は後段で実行
+            pass
 
-        # --- debug.skip_val が True の場合は、このエポックの評価を完全にスキップ ---
-        if skip_val:
-            print("[debug] skip_val=True → skipping validation for this epoch.")
-            # 検証を飛ばす場合でも以降の保存処理は実行したいので、
-            # validation 部分（評価・ログ記録・早期終了判定）をスキップして保存パートへ進む。
-            # 以降の保存処理に必要な変数は特に無いのでそのまま continue せず落ちる。
-        else:
-            # ========= VALIDATION（EMA重みで） =========
+        if not skip_val:
             model.eval()
             backup = {k: (v.detach().to("cpu", copy=True) if torch.is_tensor(v) else v) for k, v in model.state_dict().items()}
             torch.cuda.empty_cache()
 
-            # EMA重みで評価する場合のみ適用
             if ema is not None:
                 ema.copy_to(model)
             with torch.no_grad():
                 total = 0.0
                 count = 0
                 iou_list, iou05_list, iou035_list, iou075_list = [], [], [], []
-                once = True
-                # --- 検証メトリクスのエポック平均用アキュムレータ ---
                 prob_sum = 0.0
                 prob_pos_sum = 0.0
                 prob_neg_sum = 0.0
                 pix_pos = 0
                 pix_neg = 0
-                pix_all = 0
+                n_imgs = 0
+                img_count = 0
 
+                once = True
                 for batch in dl_va:
                     images = batch.get("image", batch.get("images")).to(device, non_blocking=True)
-
                     soft   = batch["soft_mask"].to(device, dtype=torch.float32)
 
                     out = model({"image": images, "text": _ensure_list_text(batch.get("text"), images.size(0))}, compute_lm=False)
@@ -1343,16 +1312,14 @@ def train(cfg: Dict[str, Any]):
                         A_prob_hw = torch.nan_to_num(out["attn_maps"], nan=0.0, posinf=1.0, neginf=0.0).clamp(1e-6, 1-1e-6)
                         Ht, Wt = A_prob_hw.shape[-2:]
                         A_logit_hw = torch.logit(A_prob_hw)
+                        sm_hw = _mask_to_feat_hw(soft, (Ht, Wt))
+                        probs = torch.sigmoid(A_logit_hw).to(torch.float32)
+                        gt    = sm_hw.to(torch.float32)
+                        B = probs.size(0)
+                        img_count += B
+                        flat = probs.view(B, -1)
 
-                    sm_hw = _mask_to_feat_hw(soft, (Ht, Wt))
-
-                    probs = torch.sigmoid(A_logit_hw).to(torch.float32)
-                    gt    = sm_hw.to(torch.float32)
-                    B = probs.size(0)
-                    flat = probs.view(B, -1)
-                    # --- 検証: エポック平均用に集計 ---
                     prob_sum += float(probs.mean().item()) * B
-                    # 正/負画素平均は画素数で重み付け
                     pos_mask = (gt >= 0.5)
                     neg_mask = ~pos_mask
                     pv = probs[pos_mask]
@@ -1363,9 +1330,6 @@ def train(cfg: Dict[str, Any]):
                     if nv.numel() > 0:
                         prob_neg_sum += float(nv.mean().item()) * nv.numel()
                         pix_neg += nv.numel()
-                    pix_all += probs.numel()
-
-                    # 複数quantile（検証は p=eval_q1 の代表値とするが、必要なら拡張可能）
                     p = eval_q1
                     thr_q = torch.quantile(flat, q=p, dim=1).view(B, 1, 1, 1)
                     pred_q = (probs >= thr_q).float()
@@ -1374,7 +1338,7 @@ def train(cfg: Dict[str, Any]):
                         inter = (pred * gt).sum((2, 3))
                         union = (pred + gt - pred * gt).sum((2, 3)) + 1e-6
                         return (inter / union).mean().item()
- 
+
                     pred_05   = (probs >= 0.5).float()
                     pred_035  = (probs >= 0.35).float()
                     pred_075  = (probs >= 0.75).float()
@@ -1393,7 +1357,7 @@ def train(cfg: Dict[str, Any]):
                     loss_attn_val = nn.BCEWithLogitsLoss(reduction="mean")(A_logit_hw, gt)
                     total += (lw.get("attn", 0.5) * loss_attn_val.item() + (cfg.get("box_target_weight", 1.0)) * dicebce.item())
                     count += 1
- 
+
                     if once:
                         print("[val-sanity] images mean/std:", float(images.mean()), float(images.std()))
                         sm = batch["soft_mask"].to(torch.float32)
@@ -1407,11 +1371,9 @@ def train(cfg: Dict[str, Any]):
                 val_iou_035 = float(np.mean(iou035_list)) if len(iou035_list) > 0 else 0.0
                 val_iou_075 = float(np.mean(iou075_list)) if len(iou075_list) > 0 else 0.0
 
-            # EMA -> 元重みに戻す
             model.load_state_dict(backup)
 
             dt = time.time() - t0
-            # epochスループットの要約
             epoch_ips = float(iter_ema_ips or 0.0)
             total_elapsed = time.perf_counter() - wall0
             print(
@@ -1429,17 +1391,15 @@ def train(cfg: Dict[str, Any]):
                 "val_iou_05": round(float(val_iou_05), 6),
                 "val_iou_075": round(float(val_iou_075), 6),
                 "elapsed_sec": round(float(dt), 1),
-                "imgs_per_sec_ema": globals().get("imgs_per_sec_ema", None),
-                "sec_per_iter_ema": globals().get("sec_per_iter_ema", None),
+                "imgs_per_sec_ema": None,
+                "sec_per_iter_ema": None,
             }
             writer.add_scalar("val/loss", float(val_loss), ep)
             writer.add_scalar("val/iou@p(cur)", float(val_iou_q), ep)
             writer.add_scalar("val/iou@0.35", float(val_iou_035), ep)
             writer.add_scalar("val/iou@0.5", float(val_iou_05), ep)
             writer.add_scalar("val/iou@0.75", float(val_iou_075), ep)
-            # --- 検証スカラーはエポック平均で記録（最後のバッチのみの偏りを除去） ---
-            bs_va = max(1, len(dl_va))
-            writer.add_scalar("val/prob_mean", float(prob_sum / max(1, (count))), ep)
+            writer.add_scalar("val/prob_mean", float(prob_sum / max(1, img_count)), ep)
             if pix_pos > 0:
                 writer.add_scalar("val/prob_pos_mean", float(prob_pos_sum / pix_pos), ep)
             if pix_neg > 0:
@@ -1451,8 +1411,7 @@ def train(cfg: Dict[str, Any]):
             _jsonl_append(epoch_jsonl, {**epoch_row,
                                         "quantile_p": cfg.get("eval", {}).get("quantile_p", 0.85),
                                         "quantile_p0": cfg.get("eval", {}).get("quantile_p0", 0.90)})
-            # ===== 早期停止（optional：YAMLの early_stop を実際に反映） =====
-            # early_metric: "val_iou_05" or default "val_iou_p"
+            # 早期停止
             score = val_iou_05 if early_metric == "val_iou_05" else val_iou_q
             if score > early_best:
                 early_best, early_wait = score, 0
@@ -1460,15 +1419,14 @@ def train(cfg: Dict[str, Any]):
                 early_wait += 1
             if early_patience > 0 and early_wait >= early_patience:
                 print(f"[early-stop] no improvement on {early_metric} for {early_patience} epochs.")
-                break
-
+                reached_max = True  # 保存後に抜ける
         # ========== 保存（軽量→フル） ==========
-        # 1) 軽量（EMA重み, safetensors併用可）
         if ema is not None:
             ema.copy_to(model)
         light_sd = {
-            "modl": {k: v.detach().cpu() for k, v in model.state_dict().item()},
-                    "cfg": cfg, "epoch": ep}
+            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            "cfg": cfg, "epoch": ep
+        }
         light_path = os.path.join(out_dir, "checkpoints", f"weights_ep{ep}.pt")
         try:
             atomic_torch_save(light_sd, light_path, use_legacy=False)
@@ -1478,11 +1436,10 @@ def train(cfg: Dict[str, Any]):
         if atomic_safe_save is not None:
             st_path = os.path.join(out_dir, "checkpoints", f"weights_ep{ep}.safetensors")
             try:
-                atomic_safe_save(light_sd["model"], st_path)
+                atomic_safe_save({k: v.detach().cpu() for k, v in model.state_dict().items()}, st_path)
             except Exception as e:
                 print("[warn] safetensors light save failed:", repr(e))
-
-        # 2) フル
+        # フル
         full_ckpt = {
             "model": model.state_dict(),
             "optimizer": optim.state_dict(),
@@ -1499,8 +1456,6 @@ def train(cfg: Dict[str, Any]):
         except Exception as e:
             print("[warn] full save zip failed, retry legacy:", repr(e))
             atomic_torch_save(full_ckpt, full_path, use_legacy=True)
-
-        # --- max_steps 到達であればエポック末の保存後に終了 ---
         if max_steps > 0 and reached_max:
             print(f"[train] Training stopped after reaching max_steps={max_steps}. Final epoch: {ep}")
             break
@@ -1508,18 +1463,16 @@ def train(cfg: Dict[str, Any]):
         # 元重みへ戻す
         # skip_val のときは backup を作っていないので存在チェック
         if 'backup' in locals():
-            model.load_state_dict(backup)   
+            model.load_state_dict(backup)
     writer.close()
     # ---- total wall time ----
     total_wall = time.perf_counter() - wall0
     hh = int(total_wall // 3600); mm = int((total_wall % 3600) // 60); ss = int(total_wall % 60)
     print(f"[train] total wall time: {hh:02d}:{mm:02d}:{ss:02d}  ({total_wall:.1f}s)")
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", type=str, required=True, help="yaml config")
     args = ap.parse_args()
-
     with open(args.cfg, "r") as f:
         cfg = yaml.safe_load(f)
 

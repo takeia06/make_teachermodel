@@ -765,7 +765,7 @@ def _maybe_resume(model, optim, scheduler, scaler, ema, cfg) -> int:
         if "scaler" in ckpt and ckpt["scaler"] is not None and scaler is not None:
             try: scaler.load_state_dict(ckpt["scaler"])
             except Exception as e: print("[resume] scaler.load_state_dict failed:", repr(e))
-        if "ema" in ckpt and isinstance(ckpt["ema"], dict):
+        if "ema" in ckpt and isinstance(ckpt["ema"], dict) and (ema is not None):
             # EMA は CPU 保持が安全
             ema.ema = {k: (v.to("cpu") if torch.is_tensor(v) else v) for k, v in ckpt["ema"].items()}
         global_step = int(ckpt.get("global_step", 0))
@@ -901,12 +901,17 @@ def train(cfg: Dict[str, Any]):
         t_mult = int(sgdr_cfg.get("t_mult", 2))
         eta_min = float(sgdr_cfg.get("eta_min", 1e-6))
         scheduler = build_sgdr(optim, t0=t0, t_mult=t_mult, eta_min=eta_min)
+    elif sched_name == "constant":
+        # 学習率を完全に一定にする
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lambda step: 1.0)
     else:
         scheduler = build_warmup_cosine(optim, lr_warmup_steps, total_steps)
 
+    console_compact = bool(cfg.get("train", {}).get("console_compact", True))
+
     # EMA（CPU/学習対象のみ）
     ema_decay = cfg.get("ema_decay", 0.999)
-    if ema_decay is None or (isinstance(ema_datay, (int, float)) and ema_decay <= 0):
+    if (ema_decay is None) or (isinstance(ema_datay, (int, float)) and float(ema_decay) <= 0):
         ema = None
         try:
             logger.info("[ema] disabled")
@@ -1207,7 +1212,7 @@ def train(cfg: Dict[str, Any]):
                     except Exception as e:
                         print("[warn] save_attn_vis failed:", repr(e))
                 avg_loss = running / log_interval
-                row = {
+                base_row = {
                     "epoch": ep, "iter": it, "global_step": global_step,
                     "loss": round(float(avg_loss), 6),
                     "attn": round(float(loss_attn_val.item()), 6),
@@ -1223,7 +1228,7 @@ def train(cfg: Dict[str, Any]):
                 }
                 # 追加: p70/p80/p90 をCSV/TBへ
                 for k, v in iou_qs.items():
-                    row[k] = round(float(v), 6)
+                    base_row[k] = round(float(v), 6)
 
                 writer.add_scalar("train/loss", float(avg_loss), global_step)
                 writer.add_scalar("train/sec_per_iter", float(iter_ema_sec or iter_sec), global_step)
@@ -1241,21 +1246,35 @@ def train(cfg: Dict[str, Any]):
                 writer.add_scalar("train/gt_pos_ratio", float((sm_hw>0.5).float().mean().item()), global_step)
 
 
+                # 速度・ETAをbase_rowに統合して1回だけかく
+                row = {
+                    **base_row,
+                    "sec_per_iter": round(float(iter_ema_sec or iter_sec), 6),
+                    "imgs_per_sec": round(float(iter_ema_ips or ips), 2),
+                    "eta_epoch_min": round(float(eta_epoch_sec/60.0), 2),
+                    "eta_total_min": round(float(eta_total_sec/60.0), 2),
+                }
                 _csv_append(
                     train_csv, row,
-                    field_order=["epoch","iter","global_step","loss","attn","box","ctr","lm","box_w",
-                                 "iou_p70","iou_p80","iou_p90","iou_05","iou_size","pos_mean","neg_mean","p_cur"]
+                    field_order=[
+                        "epoch", "iter", "global_step", "loss", "attn", "box", "ctr", "lm", "box_w",
+                        "iou_p70", "iou_p80", "iou_p90", "iou_05", "iou_size", "pos_mean", "neg_mean", "p_cur",
+                        "sec_per_iter", "imgs_per_sec", "eta_epoch_min", "eta_total_min"
+                    ]
                 )
-                # 追記: 速度・ETA をCSVにも
-                row_speed = {"sec_per_iter": round(float(iter_ema_sec or iter_sec), 6),
-                             "imgs_per_sec": round(float(iter_ema_ips or ips), 2),
-                             "eta_epoch_min": round(float(eta_epoch_sec/60.0), 2),
-                             "eta_total_min": round(float(eta_total_sec/60.0), 2)}
-                _csv_append(train_csv, {**row, **row_speed},
-                            field_order=[*["epoch","iter","global_step","loss","attn","box","ctr","lm","box_w",
-                                           "iou_p70","iou_p80","iou_p90","iou_05","iou_size","pos_mean","neg_mean","p_cur"],
-                                         "sec_per_iter","imgs_per_sec","eta_epoch_min","eta_total_min"])
+
                 running = 0.0
+
+                # --- コンソールは“要点だけ”の一行表示 ---
+                if console_compact:
+                    if it == 1 or (it % max(50, log_interval*10) == 1):
+                        print("epoch¥titer¥tags^tloss¥tiou@0.5¥tpos¥tneg¥tlr¥tips")
+                    try:
+                        cur_lr = float(scheduler.get_last_lr()[0])
+                    except Exception:
+                        cur_lr = optim.param_groups[0]["lr"]
+                    print(f"{ep}¥t{it}¥t{global_step}¥t"
+                          f"{avg_loss:.4f}¥t{iou_05:.3f}¥t{pos_mean:.3f}¥t{neg_mean:.3f}¥t{cur_lr:.2e}¥t{(iter_ema_ips or ips):.2f}")
 
             # ===== mid-epoch 保存（軽量） =====
             save_every_steps = int(cfg.get("save_every_steps", 0))
@@ -1294,7 +1313,9 @@ def train(cfg: Dict[str, Any]):
             backup = {k: (v.detach().to("cpu", copy=True) if torch.is_tensor(v) else v) for k, v in model.state_dict().items()}
             torch.cuda.empty_cache()
 
-            ema.copy_to(model)
+            # EMA重みで評価する場合のみ適用
+            if ema is not None:
+                ema.copy_to(model)
             with torch.no_grad():
                 total = 0.0
                 count = 0
@@ -1443,8 +1464,10 @@ def train(cfg: Dict[str, Any]):
 
         # ========== 保存（軽量→フル） ==========
         # 1) 軽量（EMA重み, safetensors併用可）
-        ema.copy_to(model)
-        light_sd = {"model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        if ema is not None:
+            ema.copy_to(model)
+        light_sd = {
+            "modl": {k: v.detach().cpu() for k, v in model.state_dict().item()},
                     "cfg": cfg, "epoch": ep}
         light_path = os.path.join(out_dir, "checkpoints", f"weights_ep{ep}.pt")
         try:
@@ -1465,7 +1488,7 @@ def train(cfg: Dict[str, Any]):
             "optimizer": optim.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "scaler": scaler.state_dict() if scaler is not None else None,
-            "ema": getattr(ema, "ema", None),
+            "ema": (getattr(ema, "ema", None) if ema is not None else None),
             "cfg": cfg,
             "epoch": ep,
             "global_step": global_step,

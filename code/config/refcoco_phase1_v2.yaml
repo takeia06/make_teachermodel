@@ -1,0 +1,114 @@
+# ==============================================
+# Recommended config for train_refcoco.py (patched)
+# 根拠: あなたが共有した train_refcoco.py / qformer_refcoco.py / refcoco_dataset.py の実装挙動に合わせて、
+# 参照されるキーのみを残し、無視されるキーは削除/注記しています。
+# - build_optimizer: lr_head / lr_q_kv / lr_q_last / wd_head / wd_body を使用
+# - scheduler: lr_warmup_steps を使用（train.warmup_stepsは記録用）
+# - eval: quantile_p を使用
+# - dataset: use_answers / val_answer_mode / augment.* を使用
+# ==============================================
+
+out_dir: /home/takei/AnomalyGPT/outputs/refcoco_phase1_v8
+resume: /home/takei/AnomalyGPT/outputs/refcoco_phase1_v8/checkpoints/best_iou_ep14.pt
+
+# --- DataLoader system-level knobs used by build_loaders() ---
+# （train.* ではなくトップレベルで参照されます）
+num_workers: 0           # まずは0で安定動作 → 安定確認後 4〜8 を推奨
+pin_memory: true
+# batch_size は train.batch_size もしくはトップレベル batch_size を参照
+# 今回は train 側で指定
+
+train:
+  batch_size: 4
+  epochs: 24
+  amp: true
+  save_attn_vis: true
+  save_every: 200
+  log_interval: 50
+  optimizer: adamw        # （注）現行コードでは表示用。実際の最適化は build_optimizer のPG定義に依存
+  scheduler: cosine       # （注）表示用。実際は build_warmup_cosine + lr_warmup_steps を使用
+  warmup_steps: 1500      # ログ用メモ（実際は lr_warmup_steps を参照）
+
+# --- Optimizer (layer-wise LR / WD) ---
+# ヘッド > 最終層 > KV の順。初期収束を速めるためヘッドを 7e-5 に微増。
+lr_head: 7.0e-5
+lr_q_kv:  5.0e-6
+lr_q_last: 1.0e-5
+wd_head: 0.0            # projector / query 等のヘッドは正則化ゼロ
+wd_body: 0.01           # Q-Former本体は軽く正則化
+
+# --- Scheduler (used by code) ---
+lr_warmup_steps: 1500   # 総ステップが多くない前提で 1500 に短縮（早めにcosineへ）
+
+model:
+  llm_name: /home/takei/AnomalyGPT/pretrained_ckpt/vicuna_ckpt/7b_v1.5
+  num_queries: 16
+  proj_dim_in: 768
+  proj_dim_out: 4096
+  max_txt_len: 64
+  load_vicuna: false       # Phase1: LMは凍結/未ロード（InfoNCE/LMLossは0のまま）
+  feat_hw: [112, 112]      # Tinyフォールバック時のみのヒント（OpenCLIP使用時は無視）
+  patch: 8                  # Tinyフォールバック用（OpenCLIP使用時は無視）
+  max_alpha: 0.85
+
+loss_weights:
+  attn: 0.45    # 0.50→0.45: BCEに寄りすぎないよう微調整
+  box:  1.55    # 1.5→1.55: Dice主導での初期立ち上がりをさらに後押し
+  contrast: 0.0
+  lm: 0.0
+
+# box 損失の立ち上げ（warmupで w_box = box_target_weight * t の直線遷移）
+box_warmup_steps: 1000    # 1000→800 で立ち上がりを僅かに前倒し
+box_target_weight: 0.8
+
+contrast:
+  temperature: 0.20       # （無効：contrast=0のため）
+
+# Attention 崩壊抑制
+var_reg_weight: 1.0e-3
+
+# --- Dataset ---
+dataset:
+  train_json:
+    - /home/takei/data/refcoco_data/refcoco_json/refcoco/RefCOCO_train_aug.json
+    - /home/takei/data/refcoco_data/refcoco_json/refcocopp/RefCOCOplus_train_aug.json
+    - /home/takei/data/refcoco_data/refcoco_json/refcocog/RefCOCOg_train_aug.json
+  val_json:
+    - /home/takei/data/refcoco_data/refcoco_json/refcoco/RefCOCO_val_aug.json
+    - /home/takei/data/refcoco_data/refcoco_json/refcocopp/RefCOCOplus_val_aug.json
+    - /home/takei/data/refcoco_data/refcoco_json/refcocog/RefCOCOg_val_aug.json
+
+  img_root:
+    train2014: /home/takei/data/refcoco_data/train2014
+    val2014:   /home/takei/data/refcoco_data/val2014
+    default:   /home/takei/data/refcoco_data
+
+  supervision: mask
+  long_side: 896
+  split: train
+
+  use_answers: expand
+  answer_key: answer
+  text_key: text
+  val_answer_mode: first   # 検証は first 固定（build_loadersの分岐に対応）
+
+  augment:
+    flip: true
+    color_jitter: true
+    color_jitter_params:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.05
+
+# --- Eval ---
+eval:
+  quantile_p: 0.85         # train_refcoco.py の iou@p に使用
+  iou_thresholds: [0.5, 0.35]  # 表示用メモ（コードでは 0.5/0.35 を直接計算）
+
+# --- Debug / Dev ---
+debug:
+  sanity_steps: 0
+  sanity_every: 0
+  grad_clip: 1.0            # 修正版 train_refcoco.py ではこの値を反映（未修正版は固定1.0）
+  overfit_one_batch: false  # trueで1バッチ過学習テスト

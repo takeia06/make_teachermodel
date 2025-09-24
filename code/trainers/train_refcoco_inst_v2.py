@@ -1,4 +1,108 @@
 # code/trainers/train_refcoco_inst_v2.py
+
+# ---- RUNTIME ENV SANITIZER (must run before importing torch/transformers/tensorflow) ----
+import os, re, sys
+
+def _sanitize_runtime_env():
+    """
+    * PyTorch CUDA allocator 文字列の“誤った設定”を除去/矯正
+    * Transformers が TensorFlow を自動ロードして cuDNN/BLAS を二重登録しないよう抑止
+    * どの環境でも同一の初期化順序を保証
+    """
+    # 1) TF の自動ロード抑止（cuDNN/BLAS の二重登録を避ける）
+    os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+    # TensorFlow ログを抑制（absl 初期化前の STDERR 汚染を避ける）
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+
+    # 2) PYTORCH_CUDA_ALLOC_CONF の正規化
+    raw = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if raw:
+        # 許可するキーのみ残す（複数指定・区切りミス・true/false記法の揺れを排除）
+        # 公式に安定なキー：max_split_size_mb（PyTorch 1.12+）
+        # ※ “expandable_segments” は実装差/表記揺れで落ちやすいので禁止
+        parts = re.split(r"[,\s]+", raw.strip())
+        keep = []
+        for p in parts:
+            if not p:
+                continue
+            # コロン形式に統一（= や スペースなどを : に修正）
+            p = re.sub(r"[=]", ":", p)
+            k, v = (p.split(":", 1) + [""])[:2]
+            k = k.strip().lower()
+            v = v.strip()
+            if k == "max_split_size_mb" and v.isdigit():
+                keep.append(f"max_split_size_mb:{v}")
+            # “expandable_segments” は無視（環境差でクラッシュしやすい）
+        if keep:
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = keep[0]  # 単一キーのみ
+        else:
+            # 誤設定しかなければ完全に解除
+            os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    else:
+        # 未設定なら安全側のデフォルトを与える（未対応環境でも無害）
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+
+_sanitize_runtime_env()
+# ---- END SANITIZER ----
+
+# ===========================================================
+# 注意: 本トレーナは PyTorch 専用。TensorFlow を import すると
+# cuDNN/cuBLAS/cuFFT の「factory 二重登録」ログが発生する環境がある。
+# いかなる間接依存（例: 解析ツール等）からも TF が import されないよう、
+# “tensorflow” をダミーモジュールで先回りスタブ化する。
+# “tensorflow” を**パッケージ**として先回りスタブ化する。
+# ===========================================================
+import types as _types, importlib.machinery as _im, os as _os, io as _io
+if "tensorflow" not in sys.modules:
+    _tf_stub = _types.ModuleType("tensorflow")
+    # パッケージとして振る舞わせるために __spec__ / __path__ を与える
+    _tf_stub.__file__ = "<tensorflow_stub>"
+    _tf_stub.__path__ = []  # 空でも OK（pkg と認識される）
+    _tf_stub.__spec__ = _im.ModuleSpec("tensorflow", loader=None, is_package=True)
+    # 最低限の属性をモック（例: tensorflow.config.set_visible_devices）
+    cfg_ns = _types.SimpleNamespace(set_visible_devices=lambda *a, **k: None)
+    _tf_stub.config = cfg_ns
+    # ===== tf.io.gfile の最小限実装 =====
+    class _GFile:
+        def __init__(self, path, mode="r"):
+            # TensorBoard は通常バイナリもテキストも使うのでそのまま渡す
+            self._f = open(path, mode)
+        def __enter__(self): return self._f
+        def __exit__(self, exc_type, exc, tb):
+            try: self._f.close()
+            finally: return False
+        # 代表的メソッドをフォワード（read/write/close など）
+        def __getattr__(self, name): return getattr(self._f, name)
+    def _gfile_makedirs(path, exist_ok=True): _os.makedirs(path, exist_ok=exist_ok)
+    def _gfile_exists(path): return _os.path.exists(path)
+    def _gfile_join(*parts): return _os.path.join(*parts)
+    _io_ns = _types.SimpleNamespace(
+        gfile=_types.SimpleNamespace(
+            GFile=_GFile,
+            makedirs=_gfile_makedirs,
+            mkdir=_gfile_makedirs,     # 互換 alias
+            exists=_gfile_exists,
+            join=_gfile_join,
+        )
+    )
+    _tf_stub.io = _io_ns
+    sys.modules["tensorflow"] = _tf_stub
+    # よく参照されるサブパッケージも空で先回り（find_spec が落ちないように）
+    for _sub in ("tensorflow.python", "tensorflow.experimental"):
+        if _sub not in sys.modules:
+            _m = _types.ModuleType(_sub)
+            _m.__file__ = "<tensorflow_stub>"
+            _m.__path__ = []
+            _m.__spec__ = _im.ModuleSpec(_sub, loader=None, is_package=True)
+            sys.modules[_sub] = _m
+
+from PIL import Image, ImageDraw
+_RESAMPLING = getattr(Image, "Resampling", None)
+_BICUBIC   = _RESAMPLING.BICUBIC if _RESAMPLING is not None else Image.BICUBIC
+_NEAREST   = _RESAMPLING.NEAREST if _RESAMPLING is not None else Image.NEAREST
+# 以降は _BICUBIC / _NEAREST だけを使う（処理中に再解決しない）
+
 import os
 import time
 import argparse
@@ -17,6 +121,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+
+import traceback
+import signal
 
 # =======================
 # モデル本体（修正後を利用）
@@ -123,6 +230,80 @@ def total_variation(x: torch.Tensor) -> torch.Tensor:
     tv_w = (x[:,:,:,1:] - x[:,:,:,:-1]).abs().mean()
     return tv_h + tv_w
 
+# --- 追加: 評価用 温度スケーリング & 小領域除去ユーティリティ（推論/評価のみで使用） ---
+def _apply_temperature_to_logits(logits: torch.Tensor, T: float) -> torch.Tensor:
+    """logits を温度 T でスケーリング（T<1 でエッジをシャープに）"""
+    if T is None or T <= 0:
+        return logits
+    return logits / float(T)
+
+def _remove_small_components_bool(mask: torch.Tensor, min_area_ratio: float = 0.005) -> torch.Tensor:
+    """
+    2値マスクの小さな接続成分を除去。Torch bool テンソルを受け取り Torch で返す。
+    依存: OpenCV(cv2) があればそれを使用、無ければ skimage、どちらも無ければ素通し。
+    入力: (B,1,H,W) or (H,W) いずれも可。
+    """
+    if min_area_ratio is None or min_area_ratio <= 0:
+        return mask
+    orig_shape = mask.shape
+    is_batched = (mask.ndim == 4)
+    device = mask.device
+    dtype = mask.dtype
+
+    if not is_batched:
+        mask_np = mask.detach().cpu().numpy().astype(np.uint8)
+        H, W = mask_np.shape[-2], mask_np.shape[-1]
+        min_area = max(1, int(H * W * float(min_area_ratio)))
+        try:
+            import cv2
+            comp = (mask_np * 255).astype(np.uint8)
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(comp, connectivity=4)
+            keep = np.zeros_like(mask_np, dtype=bool)
+            for lab in range(1, n):
+                if stats[lab, cv2.CC_STAT_AREA] >= min_area:
+                    keep |= (labels == lab)
+            out = torch.from_numpy(keep).to(device=device)
+            return out.to(dtype=dtype)
+        except Exception:
+            try:
+                from skimage import measure
+                labels = measure.label(mask_np, connectivity=1)
+                keep = np.zeros_like(mask_np, dtype=bool)
+                for lab in range(1, labels.max() + 1):
+                    if (labels == lab).sum() >= min_area:
+                        keep |= (labels == lab)
+                out = torch.from_numpy(keep).to(device=device)
+                return out.to(dtype=dtype)
+            except Exception:
+                return mask
+    else:
+        B, C, H, W = mask.shape
+        min_area = max(1, int(H * W * float(min_area_ratio)))
+        out_list = []
+        for b in range(B):
+            m = mask[b, 0].detach().cpu().numpy().astype(np.uint8)
+            try:
+                import cv2
+                comp = (m * 255).astype(np.uint8)
+                n, labels, stats, _ = cv2.connectedComponentsWithStats(comp, connectivity=4)
+                keep = np.zeros_like(m, dtype=bool)
+                for lab in range(1, n):
+                    if stats[lab, cv2.CC_STAT_AREA] >= min_area:
+                        keep |= (labels == lab)
+            except Exception:
+                try:
+                    from skimage import measure
+                    labels = measure.label(m, connectivity=1)
+                    keep = np.zeros_like(m, dtype=bool)
+                    for lab in range(1, labels.max() + 1):
+                        if (labels == lab).sum() >= min_area:
+                            keep |= (labels == lab)
+                except Exception:
+                    keep = m.astype(bool)
+            out_list.append(torch.from_numpy(keep)[None, None])
+        out = torch.cat(out_list, dim=0).to(device=device, dtype=dtype)
+        return out    
+
 # --- 追加: MixUp（Phase1向け） ---
 
 def maybe_mixup(img: torch.Tensor, mask: torch.Tensor, alpha: float = 0.2, prob: float = 0.0):
@@ -212,9 +393,7 @@ try:
     def atomic_safe_save(state_dict: dict, path: str):
         d = os.path.dirname(path)
         os.makedirs(d, exist_ok=True)
-        tmppath = path + ".tmp"
-        safe_save(state_dict, tmppath)
-        os.replace(tmppath, path)
+        raise RuntimeError("safetensors save is disabled to avoid RAM spikes")
 except Exception:
     safe_save = None
     atomic_safe_save = None
@@ -417,6 +596,21 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
         print("  reason:", repr(e))
 
     if RefCOCOCls is not None:
+        # ---- helper: disable all val-time augmentations ----
+        def _disable_val_aug(aug: Optional[dict]) -> Optional[dict]:
+            if not isinstance(aug, dict):
+                return None
+            a = dict(aug)
+            # hard off at validation
+            if "flip" in a: a["flip"] = False
+            if "color_jitter" in a: a["color_jitter"] = False
+            rrc = a.get("random_resized_crop", None)
+            if isinstance(rrc, dict):
+                rrc = dict(rrc)
+                rrc["enabled"] = False
+                a["random_resized_crop"] = rrc
+            return a
+
         train_json = dcfg.get("json", dcfg.get("train_json"))
         val_json   = dcfg.get("val_json", None)
         if train_json is None:
@@ -442,11 +636,18 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
             long_side=long_side,
             supervision=supervision,
             soft_cfg=soft_cfg,
+            # ★ 学習はAug有効（そのまま）
             augment=augment,
             text_key=dcfg.get("text_key", "text"),
             answer_key=dcfg.get("answer_key", "answer"),
             use_answers=dcfg.get("use_answers", "expand"),
             sample_ratios=dcfg.get("sample_ratios", None),
+            # --- 小規模検証用の追加引数をそのまま渡す ---
+            limit_items=dcfg.get("limit_items", None),
+            limit_per_source=dcfg.get("limit_per_source", None),
+            shuffle=dcfg.get("shuffle", True),
+            strict_exist=dcfg.get("strict_exist", False),
+            seed=int(cfg.get("seed", 42)),
         )
 
         _val_mode = str(dcfg.get("val_answer_mode", "first")).lower().strip()
@@ -460,18 +661,25 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
             long_side=long_side,
             supervision=supervision,
             soft_cfg=soft_cfg,
-            augment=augment,
+            # ★ 評価はAug完全OFF
+            augment=_disable_val_aug(augment),
             text_key=dcfg.get("text_key", "text"),
             answer_key=dcfg.get("answer_key", "answer"),
             use_answers=_val_use_answers,
-            sample_ratios=dcfg.get("sample_ratios", None),
+            limit_items=dcfg.get("limit_items", None),
+            limit_per_source=dcfg.get("limit_per_source", None),
+            shuffle=dcfg.get("shuffle", True),
+            strict_exist=dcfg.get("strict_exist", False),
+            seed=int(cfg.get("seed", 42)),
         )
 
         bs  = int(cfg.get("batch_size", cfg.get("train", {}).get("batch_size", 4)))
         nw  = int(cfg.get("num_workers", 0))
         pin = bool(cfg.get("pin_memory", True))
+        # overfit_one_batch のときは shuffle=False にして同一バッチ固定
+        _ofb = bool(cfg.get("debug", {}).get("overfit_one_batch", False))
         dl_tr = DataLoader(
-            ds_tr, batch_size=bs, shuffle=True,
+            ds_tr, batch_size=bs, shuffle=(not _ofb),
             num_workers=nw, pin_memory=pin, drop_last=True,
             collate_fn=refcoco_collate, persistent_workers=False
         )
@@ -483,8 +691,22 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
         return dl_tr, dl_va
 
     # -------- フォールバック（画像フォルダ） --------
-    tr_dir = cfg.get("train_dir") or cfg.get("data", {}).get("train_dir") or dcfg.get("img_root")
-    va_dir = cfg.get("val_dir")   or cfg.get("data", {}).get("val_dir")   or dcfg.get("val_img_root", dcfg.get("img_root"))
+    # 解像: dict(img_root) → 文字列パス
+    def _pick_root(ir, split_key):
+        if isinstance(ir, dict):
+            if split_key == "train":
+                return ir.get("train2014") or ir.get("default")
+            else:
+                return ir.get("val2014") or ir.get("default")
+        return ir
+
+    tr_dir = cfg.get("train_dir") or cfg.get("data", {}).get("train_dir")
+    if not tr_dir:
+        tr_dir = _pick_root(dcfg.get("img_root"), "train")
+
+    va_dir = cfg.get("val_dir") or cfg.get("data", {}).get("val_dir")
+    if not va_dir:
+        va_dir = _pick_root(dcfg.get("val_img_root", dcfg.get("img_root")), "val")
 
     if not tr_dir or not va_dir:
         raise KeyError(
@@ -505,11 +727,13 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
     ds_tr = _SimpleRefCOCODataset(tr_dir, tr_mask, image_size=ims, dummy_text=dummy_text)
     ds_va = _SimpleRefCOCODataset(va_dir, va_mask, image_size=ims, dummy_text=dummy_text)
 
-    dl_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True,  num_workers=nw, pin_memory=pin, drop_last=True,  collate_fn=refcoco_collate)
+    dl_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True,  
+    num_workers=nw, pin_memory=pin, drop_last=True,  collate_fn=refcoco_collate)
     dl_va = DataLoader(ds_va, batch_size=bs, shuffle=False, num_workers=nw, pin_memory=pin, drop_last=False, collate_fn=refcoco_collate)
     return dl_tr, dl_va
 
-# === 超簡易・凍結ビジョンエンコーダ（フォールバック用） ===
+
+# === 超簡易・凍結ビジョンエンコーダ（OpenCLIP失敗時のフォールバック） ===
 class TinyFrozenConvVision(nn.Module):
     def __init__(self, out_dim: int = 768, patch: int = 16):
         super().__init__()
@@ -537,11 +761,11 @@ def build_model(cfg: Dict[str, Any], device: torch.device) -> nn.Module:
         oc_name = mcfg.get("openclip_name", "ViT-g-14")
         oc_pt   = mcfg.get("openclip_pretrained", "laion2b_s34b_b88k")
         print(f"[info] Using OpenCLIP {oc_name} ({oc_pt}).")
-        vision = OpenCLIPVisionFrozen(model_name=oc_name, pretrained=oc_pt).to(device).eval()
+        vision = OpenCLIPVisionFrozen(model_name=oc_name, pretrained=oc_pt).eval()
     except Exception as e:
         print("[warn] OpenCLIPViTL14Frozen init failed -> fallback to TinyFrozenConvVision")
         print("  reason:", repr(e))
-        vision = TinyFrozenConvVision(out_dim=proj_dim_in, patch=int(mcfg.get("patch", 16))).to(device).eval()
+        vision = TinyFrozenConvVision(out_dim=proj_dim_in, patch=int(mcfg.get("patch", 16))).eval()
 
     enc_kv_dim = int(mcfg.get("encoder_hidden_size", 1408))
 
@@ -558,7 +782,8 @@ def build_model(cfg: Dict[str, Any], device: torch.device) -> nn.Module:
         text_cond_mode=str(mcfg.get("text_cond_mode", "bias")),
         num_text_kv=int(mcfg.get("num_text_kv", 0)),
         qformer_kv_dim=enc_kv_dim,
-    ).to(device)
+    )
+    model = model.to(device)
     try:
         if hasattr(model, "qformer") and hasattr(model.qformer, "bert"):
             model.qformer.bert.gradient_checkpointing_enable()
@@ -594,26 +819,32 @@ def build_optimizer(model: nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optimi
     for _, p in model.named_parameters():
         p.requires_grad = False
         
-    # ---Vision: 後段ブロックだけ開放 ---
+    # ---Vision: 後段ブロックだけ開放（0 のときは完全凍結）---
     try:
         vis = getattr(model, "vision", None)
         blocks = getattr(getattr(vis, "model", vis).visual, "transformer", None).resblocks
         N = int(cfg.get("vision_unfreeze_blocks", 3))
-        N = max(1, min(N, len(blocks)))
-        for blk in blocks[-N:]:
-            for n, p in blk.named_parameters():
-                p.requires_grad = True
-                pg_vision.append(p)
-        visual = getattr(getattr(vis, "model", vis), "visual", None)
-        pe = getattr(visual, "positional_embedding", None)
-        if isinstance(pe, torch.nn.Parameter):
-            pe.requires_grad = True
-            pg_vision.append(pe)
-        ln_pre = getattr(visual, "ln_pre", None)
-        if isinstance(ln_pre, nn.LayerNorm):
-            for p in ln_pre.parameters():
-                p.requires_grad = True
-                pg_vision.append(p)
+        N = max(0, min(N, len(blocks)))
+        lr_vision = float(cfg.get("lr_vision", 5e-6))
+        if N > 0 and lr_vision > 0.0:
+            for blk in blocks[-N:]:
+                for n, p in blk.named_parameters():
+                    p.requires_grad = True
+                    pg_vision.append(p)
+            visual = getattr(getattr(vis, "model", vis), "visual", None)
+            pe = getattr(visual, "positional_embedding", None)
+            if isinstance(pe, torch.nn.Parameter):
+                pe.requires_grad = True
+                pg_vision.append(pe)
+            ln_pre = getattr(visual, "ln_pre", None)
+            if isinstance(ln_pre, nn.LayerNorm):
+                for p in ln_pre.parameters():
+                    p.requires_grad = True
+                    pg_vision.append(p)
+        else:
+            # 完全凍結（勾配計算も抑止）
+            for p in getattr(getattr(vis, "model", vis), "parameters")():
+                p.requires_grad = False
     except Exception as e:
         print("[warn] vision unfreeze skipped:", repr(e))
 
@@ -652,7 +883,8 @@ def build_optimizer(model: nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optimi
             {"params": pg_q_kv,    "lr": lr_qkv,    "weight_decay": wd_body},
             {"params": pg_q_last,  "lr": lr_last,   "weight_decay": wd_body},
             {"params": pg_head,    "lr": lr_head,   "weight_decay": wd_head},
-            {"params": pg_vision,  "lr": lr_vision, "weight_decay": wd_body},
+            # vision を解凍しない（または lr_vision==0）の場合は param group を追加しない
+            *(([{"params": pg_vision, "lr": lr_vision, "weight_decay": wd_body}] ) if (len(pg_vision) > 0 and lr_vision > 0.0) else []),
         ],
         betas=(0.9, 0.999),
     )
@@ -706,13 +938,27 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
+    # ===== 外部SIGKILLなどの捕捉（最低限のダンプ） =====
+    import signal, traceback
+    def _sig_handler(signum, frame):
+        print(f"[fatal] received signal {signum} -> likely external kill; flushing logs and exiting.", flush=True)
+        try:
+            import faulthandler
+            faulthandler.dump_traceback()
+        except Exception:
+            pass
+        raise SystemExit(128 + signum)
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try: signal.signal(_sig, _sig_handler)
+        except Exception: pass
+
 # =========================================================
 # （追加）再開ユーティリティ
 # =========================================================
 def _maybe_resume(model, optim, scheduler, scaler, ema, cfg) -> int:
-    """returns global_step after resume (0 if fresh)"""
-    resume_path = cfg.get("resume", None)
-    resume_full = bool(cfg.get("resume_full", False))
+    # 未定義変数/関数の修正：cfgから安全に取得
+    resume_path = cfg.get("resume", cfg.get("train", {}).get("resume", ""))
+    resume_full = bool(cfg.get("resume_full", cfg.get("train", {}).get("resume_full", False)))
     global_step = 0
     if not resume_path:
         return 0
@@ -728,11 +974,15 @@ def _maybe_resume(model, optim, scheduler, scaler, ema, cfg) -> int:
 
     ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
     sd = ckpt.get("model", ckpt)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
+    res = model.load_state_dict(sd, strict=False)
     print(f"[resume] torch.load (cpu) loaded: {resume_path}")
-    if missing:   print("[resume] missing keys:", len(missing))
-    if unexpected:print("[resume] unexpected keys:", len(unexpected))
-
+    try:
+        missing = getattr(res, "missing_keys", [])
+        unexpected = getattr(res, "unexpected_keys", [])
+        if missing:   print("[resume] missing keys:", len(missing))
+        if unexpected:print("[resume] unexpected keys:", len(unexpected))
+    except Exception:
+        pass
     if resume_full and isinstance(ckpt, dict):
         if "optimizer" in ckpt and ckpt["optimizer"] is not None:
             try: optim.load_state_dict(ckpt["optimizer"])
@@ -777,6 +1027,21 @@ def _gate_from_cfg(step: int, sw: Optional[dict], default: float = 1.0) -> float
 
 def train(cfg: Dict[str, Any]):
     torch.backends.cudnn.benchmark = True
+
+    # ===== Signal handler to catch external kills =====
+    def _sig_handler(signum, frame):
+        print(f"[fatal] received signal {signum} -> likely external kill; flushing logs and exiting.", flush=True)
+        try:
+            import faulthandler
+            faulthandler.dump_traceback()
+        except Exception:
+            pass
+        raise SystemExit(128 + signum)
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(_sig, _sig_handler)
+        except Exception:
+            pass
     set_seed(int(cfg.get("seed", 42)))
 
     dbg_cfg = cfg.get("debug", {})
@@ -789,9 +1054,18 @@ def train(cfg: Dict[str, Any]):
     os.makedirs(os.path.join(out_dir, "checkpoints"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "attn_vis"), exist_ok=True)
 
-    from torch.utils.tensorboard import SummaryWriter
-    tb_dir = os.path.join(out_dir, "tb")
-    writer = SummaryWriter(log_dir=tb_dir)
+    # ===== TensorBoard: allow disabling via cfg.logging.tensorboard =====
+    writer = None
+    tb_enabled = bool(cfg.get("logging", {}).get("tensorboard", True))
+    if tb_enabled:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_dir = os.path.join(out_dir, "tb")
+            writer = SummaryWriter(log_dir=tb_dir)
+        except Exception as _tb_e:
+            # TensorBoard 周りで落ちる環境は一定数あるので、学習継続を優先して無効化
+            print("[warn] TensorBoard unavailable -> disabling tensorboard logging. reason:", repr(_tb_e))
+            writer = None
 
     log_dir = os.path.join(out_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
@@ -809,6 +1083,24 @@ def train(cfg: Dict[str, Any]):
     print("[debug] cfg.train.max_steps = ", cfg.get("train", {}).get("max_steps"))
     print("[debug] cfg.train.max_steps_per_epoch =", cfg.get("train", {}).get("max_steps_per_epoch"))
     print("[debug] len(dl_tr) =", len(dl_tr), "| len(dl_va) =", len(dl_va))
+    # --- 追加: 開始時の入出力健全性クイックチェック（1バッチ） ---
+    try:
+        _batch0 = next(iter(dl_tr))
+        _txt0 = _batch0.get("text", [""])[0]
+        _img0 = _batch0.get("path", [""])[0]
+        _sm0  = _batch0.get("soft_mask")
+        _posr = float((_sm0[0] >= 0.5).float().mean().item()) if torch.is_tensor(_sm0) else float('nan')
+        print(f"[sanity@start] text[0]={repr(_txt0)[:120]}")
+        print(f"[sanity@start] path[0]={_img0}")
+        print(f"[sanity@start] soft_mask>0.5 ratio (sample0)={_posr:.4f}")
+        # ★ 空テキストは訓練停止ではなく警告に（cfg.dataset.text_key を見直すヒントを出す）
+        if isinstance(_txt0, str) and len(_txt0.strip()) == 0:
+            print("[warn] Empty text detected in first batch — check dataset.text_key (default now 'text'). "
+                  "Training will continue, but performance may degrade.", flush=True)
+    except StopIteration:
+        raise RuntimeError("Empty training dataloader.")
+    except Exception as _e:
+        print("[warn] start sanity-check:", repr(_e))
 
     # 入力解像度（ViT/14 のパッチ解像に直結）を YAML に合わせて統一
     long_side = int(cfg.get("dataset", {}).get("long_side", 896))
@@ -816,17 +1108,19 @@ def train(cfg: Dict[str, Any]):
     # Model
     model = build_model(cfg, device)
 
-    # Vision/LLM の確実な凍結（名前に依存しない）
-    if hasattr(model, "vision_encoder") and (model.vision_encoder is not None):
-        for p in model.vision_encoder.parameters():
-            p.requires_grad = False
-    if hasattr(model, "vision") and (model.vision is not None):  # 実装差異の保険
-        for p in model.vision.parameters():
-            p.requires_grad = False
-
-    # Optimizer / Scheduler
     optim = build_optimizer(model, cfg)
     num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # (D) overfit-one-batch のときはヘッド層の学習を少し速くする（pg index=2 が pg_head）
+    overfit_1b = bool(cfg.get("debug", {}).get("overfit_one_batch", False))
+    if overfit_1b:
+        head_mult = float(cfg.get("debug", {}).get("head_lr_mult", 1.5))
+        for i, g in enumerate(optim.param_groups):
+            if i == 2:  # pg_head
+                old_lr = g.get("lr", 0.0)
+                g["lr"] = old_lr * head_mult
+        print(f"[debug] applied head LR multiplier x{head_mult} for overfit-one-batch")    
+ 
     groups = [(len(g['params']), g.get('lr', None)) for g in optim.param_groups]
     print("[sanity] trainable params:", num_trainable)
     for i,(n,lr) in enumerate(groups): print(f"[sanity] pg{i}: n={n}, lr={lr}")
@@ -837,8 +1131,12 @@ def train(cfg: Dict[str, Any]):
     use_amp  = bool(cfg.get("use_amp", tc.get("amp", True)))
     use_fp16 = bool(cfg.get("use_fp16", False))
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
-    ac_dtype = torch.float16 if (device_type == "cuda" and use_fp16) else (torch.bfloat16 if device_type=="cuda" else torch.float32)
-    scaler = amp.GradScaler(enabled=use_amp and (device_type == "cuda") and use_fp16)
+    # bf16 が使える場合は優先（NaN/Inf 低減、スループット維持）
+    bf16_ok = (device_type == "cuda" and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported())
+    ac_dtype = (torch.bfloat16 if (bf16_ok and not use_fp16) else
+                (torch.float16 if (device_type == "cuda" and use_fp16) else
+                 (torch.float32)))
+    scaler = amp.GradScaler(enabled=use_amp and (device_type == "cuda") and (ac_dtype == torch.float16))
 
     # エポックなど
     epochs = int(cfg.get("epochs", tc.get("epochs", tc.get("num_epochs", 3))))
@@ -852,7 +1150,7 @@ def train(cfg: Dict[str, Any]):
         prev_epochs = epochs
         epochs = math.ceil(max_steps / len_tr)
         print(
-            f"[train] epochs adjusted: {prov_epoches} -> {epochs} "
+            f"[train] epochs adjusted: {prev_epochs} -> {epochs} "
             f"to satisfy max_steps={max_steps} (len_tr={len_tr})"
         )
     # --- per-epoch 上限（0 なら無効）---
@@ -869,12 +1167,31 @@ def train(cfg: Dict[str, Any]):
     edge_bce_w = float(aux.get("edge_bce_w", 0.0))
     tv_w       = float(aux.get("tv_w", 0.0))
 
+    # === 前景/背景 反転スイッチ（デフォルト: False）===
+    invert_attn = bool(cfg.get("model", {}).get("invert_attn", False))    
+
     # MixUp
     mixup_prob   = float(cfg.get("mixup_prob", 0.0))
     mixup_alpha  = float(cfg.get("mixup_alpha", 0.2))
 
     # 評価設定
-    eval_q1 = float(cfg.get("eval", {}).get("quantile_p", 0.85))
+    p0 = float(cfg.get("eval", {}).get("quantile_p", 0.50))  # 初期
+    p1 = float(cfg.get("eval", {}).get("quantile_p0", 0.90)) # 目標（YAMLのquantile_p0を再利用）
+    # (FIX) デフォルト引数で lr_warmup_steps を束縛しない
+    def _p_scheduled(gs, warm=None):
+        # warm が None の場合は外側の lr_warmup_steps を使う
+        _warm = lr_warmup_steps if warm is None else warm
+        # 以降は _warm を参照（例）
+        if _warm <= 0:
+            return 1.0
+        return min(1.0, max(0.0, gs / float(max(1, _warm))))
+    # (FIX) eval.quantile_p を変数に取り込む
+    eval_cfg = cfg.get("eval", {})
+    eval_q1 = float(eval_cfg.get("quantile_p", 0.5))
+    eval_q0 = float(eval_cfg.get("quantile_p0", 0.9))
+    # （追加）評価時の温度スケーリングと小領域除去（既定有効: T=0.85, 面積0.5%）
+    eval_temp = float(eval_cfg.get("logit_temperature", 0.85))  # 0 または <=0 で無効
+    eval_min_comp = float(eval_cfg.get("min_component_ratio", 0.005))  # 0 で無効
     iou_col = f"iou_p{int(round(eval_q1*100))}"
 
     best_val = float("inf")
@@ -890,8 +1207,10 @@ def train(cfg: Dict[str, Any]):
     total_steps = epochs * len_tr
     if max_steps > 0:
         total_steps = min(total_steps, max_steps)
+    # (FIX) warmup を先に決めておく（0も許容）。後段の関数デフォルトで未定義参照しないように。
     lr_warmup_steps = int(cfg.get("lr_warmup_steps", 1000))
-    lr_warmup_steps = min(lr_warmup_steps, max(1, total_steps // 2))
+    # total_steps が小さいときでも安全にクリップ
+    lr_warmup_steps = max(0, min(lr_warmup_steps, max(1, total_steps // 2)))
     sched_name = str(cfg.get("train", {}).get("scheduler", "cosine")).lower()
     if sched_name == "sgdr":
         sgdr_cfg = cfg.get("sgdr", {})
@@ -900,7 +1219,12 @@ def train(cfg: Dict[str, Any]):
         eta_min = float(sgdr_cfg.get("eta_min", 1e-6))
         scheduler = build_sgdr(optim, t0=t0, t_mult=t_mult, eta_min=eta_min)
     elif sched_name == "constant":
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lambda step: 1.0)
+        warm = int(cfg.get("lr_warmup_steps", 50))
+        def _lambda(step):
+            if step < warm:
+                return float(step) / max(1, warm)
+            return 1.0
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=_lambda)
     else:
         scheduler = build_warmup_cosine(optim, lr_warmup_steps, total_steps)
 
@@ -908,11 +1232,15 @@ def train(cfg: Dict[str, Any]):
 
     # EMA（CPU/学習対象のみ）
     ema_decay = cfg.get("ema_decay", 0.999)
+    # 過学習テスト時はEMAを強制OFF（適応を速める）
+    if bool(cfg.get("debug", {}).get("overfit_one_batch", False)):
+        ema_decay = 0
     if (ema_decay is None) or (isinstance(ema_decay, (int, float)) and float(ema_decay) <= 0):
         ema = None
         print("[ema] disabled")
     else:
-        ema = ModelEMA(model, decay=float(ema_decay), cpu=True, trainable_only=True)
+        # Keep EMA on-device (no CPU copy). Uses param dtype (fp16/bf16) to reduce RAM.
+        ema = ModelEMA(model, decay=float(ema_decay), cpu=False, trainable_only=True)
         print(f"[ema] enabled (decay={float(ema_decay)})")
 
     # 再開
@@ -925,22 +1253,33 @@ def train(cfg: Dict[str, Any]):
     early_cfg = cfg.get("early_stop", {})
     early_metric = str(early_cfg.get("metric", "val_iou_p"))
     early_patience = int(early_cfg.get("patience", 0))
-    early_best = -1e18
+    # 追加: 改善方向と許容最小改善幅（NameError 対応）
+    early_mode = str(early_cfg.get("mode", "max")).lower()  # "max" | "min"
+    early_min_delta = float(early_cfg.get("min_delta", 0.0))
+    # ベストの初期値はモードに応じて設定
+    if early_mode == "min":
+        early_best = float("inf")
+    else:
+        early_best = -float("inf")
     early_wait = 0
 
     reached_max = False  # max_steps 到達フラグ
 
     # ========= TRAIN =========
     for ep in range(1, epochs + 1):
+        print(f"[debug] EPOCH START ep={ep}", flush=True)
         model.train()
         t0 = time.time()
         running = 0.0
         iter_ema_sec, iter_ema_ips = None, None
 
         for it, batch in enumerate(dl_tr, start=1):
+
             if it in (1, 50, 100, 101):
-                print(f"[debug: ep={ep} it={it} gs={global_step} |"
-                      f"path0={batch.get('path', [' '])[0]}")
+                print(
+                    f"[debug: ep={ep} it={it} gs={global_step} | "
+                    f"path0={batch.get('path', [''])[0]}]"
+                )
 
             iter_t0 = time.perf_counter()
             if overfit_1b:
@@ -949,13 +1288,16 @@ def train(cfg: Dict[str, Any]):
                 else:
                     batch = fixed_batch
 
-            images = batch.get("image", batch.get("images")).to(device, non_blocking=True)
+            images = batch.get("image", batch.get("images"))
+            # --- device guard: モデルが実在するデバイスに入力を合わせる ---
+            model_device = next(model.parameters()).device
+            images = images.to(model_device, non_blocking=True)
 
-            soft = batch.get("soft_mask", batch.get("mask", None))
+            soft   = batch["soft_mask"].to(model_device, dtype=torch.float32)
             if soft is None:
                 soft = torch.zeros(images.size(0), 1, images.shape[2], images.shape[3], device=images.device, dtype=torch.float32)
             else:
-                soft = soft.to(device=device, dtype=torch.float32)
+                soft = soft.to(device=model_device, dtype=torch.float32)
                 if soft.ndim == 3:
                     soft = soft.unsqueeze(1)
 
@@ -970,9 +1312,10 @@ def train(cfg: Dict[str, Any]):
 
             # ===== forward =====
             from torch import amp as _amp
-            with _amp.autocast(device_type=device_type, dtype=ac_dtype, enabled=use_amp):
-                do_lm = (lw.get("lm", 0.0) > 0.0)
-                out = model({"image": images, "text": texts}, compute_lm=do_lm)
+            try:
+                with _amp.autocast(device_type=device_type, dtype=ac_dtype, enabled=use_amp):
+                    do_lm = (lw.get("lm", 0.0) > 0.0)
+                    out = model({"image": images, "text": texts}, compute_lm=do_lm)
 
                 # ---- アテンションのロジット/確率取り出し ----
                 if "attn_logits" in out and out["attn_logits"] is not None and out["attn_logits"].ndim == 4:
@@ -984,6 +1327,9 @@ def train(cfg: Dict[str, Any]):
                     A_logit_hw = torch.logit(A_prob_hw)
                 else:
                     raise RuntimeError(f"Model outputs do not contain attn logits/maps. keys={list(out.keys())}")
+                # --- 必要に応じて“前景/背景”を反転 ---
+                if invert_attn:
+                    A_logit_hw = -A_logit_hw
 
                 if not printed_hw:
                     print(f"[sanity] attn_feat_hw = {Ht}x{Wt}  (patch=14; depends on input size)")
@@ -996,18 +1342,22 @@ def train(cfg: Dict[str, Any]):
                     continue
                 sm_hw = _mask_to_feat_hw(soft, (Ht, Wt)).clamp(0.0, 1.0)
 
-                # ===== 1) L_attn =====
-                with torch.no_grad():
-                    pos_frac = sm_hw.mean(dim=(2, 3), keepdim=True).clamp(1e-6, 1-1e-6)
-                    pos_weight = ((1.0 - pos_frac) / pos_frac).clamp(1.0, 10.0)
-                bce_per_pix   = F.binary_cross_entropy_with_logits(A_logit_hw, sm_hw, reduction="none", pos_weight=pos_weight)
-                loss_attn_val = zero_if_not_finite(bce_per_pix.mean())
+                # ===== 0) まず確率/ターゲットの共通前処理 =====
+                A_prob_hw = torch.sigmoid(A_logit_hw).to(torch.float32)       # (B,1,Ht,Wt)
+                S32       = sm_hw.to(torch.float32)
+                S_blur    = F.avg_pool2d(S32, kernel_size=3, stride=1, padding=1)
+                S_soft    = (0.7 * S32 + 0.3 * S_blur).clamp(0.0, 1.0)        # 学習時のターゲット
 
-                # ===== 2) L_box =====
-                A_prob_hw  = torch.sigmoid(A_logit_hw).to(torch.float32)
-                S32        = sm_hw.to(torch.float32)
-                S_blur     = F.avg_pool2d(S32, kernel_size=3, stride=1, padding=1)
-                S_soft     = (0.7 * S32 + 0.3 * S_blur).clamp(0.0, 1.0)
+                # ===== 1) L_attn（学習も検証と同じ per-pixel 重み方式に統一） =====
+                with torch.no_grad():
+                    pos_frac_va = S_soft.mean(dim=(2, 3), keepdim=True).clamp(1e-6, 1-1e-6)  # (B,1,1,1)
+                    pos_w_va    = ((1.0 - pos_frac_va) / pos_frac_va).clamp(1.0, 10.0)       # (B,1,1,1)
+                bce_pix_tr = F.binary_cross_entropy_with_logits(A_logit_hw, S_soft, reduction="none")  # (B,1,Ht,Wt)
+                w_pix_tr   = torch.ones_like(bce_pix_tr)
+                w_pix_tr   = torch.where(S_soft > 0.5, pos_w_va.expand_as(w_pix_tr), w_pix_tr)
+                loss_attn_val = zero_if_not_finite((bce_pix_tr * w_pix_tr).mean())
+
+                # ===== 2) L_box（Dice + BCE）=====
                 loss_box_dice = safe_dice_from_probs(A_prob_hw, S_soft)
                 loss_box_bce  = safe_bce_from_probs(A_prob_hw, S_soft)
                 loss_box_val  = 1.5 * loss_box_dice + 0.5 * loss_box_bce
@@ -1044,7 +1394,9 @@ def train(cfg: Dict[str, Any]):
                 tv_val   = total_variation(A_prob_hw)
 
                 # ------- 係数（box warmup + スイッチゲート） -------
-                t_w   = min(1.0, (global_step) / max(1, warm_steps))
+                # 最初のステップで w_box が 0 になって「loss=0」に見えないよう +1
+                denom = max(1, warm_steps)
+                t_w   = min(1.0, (global_step + 1) / float(denom))
                 w_box_base = box_target * t_w  # 0 -> box_target
                 # switch（任意）
                 switch = cfg.get("switch", {})
@@ -1063,6 +1415,10 @@ def train(cfg: Dict[str, Any]):
                 soft_iou_w = float(aux.get("soft_iou_w", 0.0))
                 edge_bce_w = float(aux.get("edge_bce_w", 0.0))
                 tv_w       = float(aux.get("tv_w", 0.0))
+                # === 前景/背景 反転スイッチ（デフォルト false）。ロジットに −1 を掛けて反転 ===
+                invert_attn = bool(cfg.get("model", {}).get("invert_attn", False))
+                # === 面積損失のデフォルトは 0.0（必要なときだけ YAML 側で明示）===
+                default_area_w = 0.0
 
                 ctr_cfg    = cfg.get("contrast", {})
                 ctr_w0     = float(ctr_cfg.get("w0", lw.get("contrast", 0.0)))
@@ -1078,10 +1434,18 @@ def train(cfg: Dict[str, Any]):
                 lovasz_w_eff = lovasz_w_cfg if global_step >= lr_warmup_steps else 0.0
                 loss_lovasz = lovasz_sigmoid(A_prob_hw, S_soft) if lovasz_w_eff > 0 else torch.tensor(0.0, device=images.device)
 
+                # === 面積整合（薄塗り・全面化の抑止を最小限に） ===
+                with torch.no_grad():
+                    gt_area_mean = S_soft.mean(dim=(1,2,3), keepdim=True)   # (B,1,1,1)
+                pred_area_mean = A_prob_hw.mean(dim=(1,2,3), keepdim=True)
+                area_loss = F.mse_loss(pred_area_mean, gt_area_mean)
+                area_w = float(cfg.get("aux_loss", {}).get("area_w", default_area_w))
+                # area_w が有効なときだけ計算に乗せる
+
                 # ------- 合算ロス -------
                 attn_coeff = lw.get("attn", 0.5) * attn_gate
                 box_coeff  = lw.get("box", 1.5) * w_box_base * box_gate
-                lm_scale  = (min(1.0, (global_step) / max(1, lm_warmup)) if lw.get("lm", 0.0) > 0 else 0.0)
+                lm_scale   = (min(1.0, (global_step) / max(1, lm_warmup)) if lw.get("lm", 0.0) > 0 else 0.0)
 
                 loss = (attn_coeff * loss_attn_val +
                         box_coeff  * loss_box_val +
@@ -1091,37 +1455,77 @@ def train(cfg: Dict[str, Any]):
                         soft_iou_w * loss_iou +
                         lovasz_w_eff * loss_lovasz +
                         edge_bce_w * bce_edge +
-                        tv_w * tv_val)
+                        tv_w * tv_val +
+                        (area_w * area_loss if area_w > 0 else 0.0))
 
                 if not torch.isfinite(loss):
                     print("[warn] non-finite total loss; skip step")
                     if use_amp: scaler.update()
                     optim.zero_grad(set_to_none=True)
                     continue
-            # ===== backward / step =====
-            if use_amp:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optim)
-                bad_grad = False
-                for p in model.parameters():
-                    if p.grad is not None and not torch.isfinite(p.grad).all():
-                        bad_grad = True
-                        break
-                if bad_grad:
-                    print("[nan-guard] non-finite grad -> zero_grad & skip update")
+            except RuntimeError as e:
+                # ---- OOMセーフティ（SIGKILL 前に可能な限り回避）----
+                if "out of memory" in str(e).lower():
+                    print("[oom] CUDA OOM detected; skipping step, empty_cache()", flush=True)
                     optim.zero_grad(set_to_none=True)
-                    scaler.update()
+                    try:
+                        if device_type == "cuda":
+                            torch.cuda.empty_cache()
+                            free, total = torch.cuda.mem_get_info()
+                            print(f"[oom] mem free/total (MiB): {free/1024/1024:.1f}/{total/1024/1024:.1f}")
+                    except Exception:
+                        pass
+                    if use_amp:
+                        scaler.update()
                     continue
-                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
-                scaler.step(optim)
-                scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
-                optim.step()
+                # それ以外の例外は従来のハンドリングへ
+                print(f"[fatal] exception during forward @ ep={ep} it={it} gs={global_step}: {repr(e)}", flush=True)
+                traceback.print_exc()
+                raise
+
+            # ===== backward / step =====
+            try:
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optim)
+                    bad_grad = False
+                    for p in model.parameters():
+                        if p.grad is not None and not torch.isfinite(p.grad).all():
+                            bad_grad = True
+                            break
+                    if bad_grad:
+                        print("[nan-guard] non-finite grad -> zero_grad & skip update")
+                        optim.zero_grad(set_to_none=True)
+                        scaler.update()
+                        continue
+                    torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
+                    scaler.step(optim)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
+                    optim.step()
+            except Exception as e:
+                print(f"[fatal] exception during backward/step @ ep={ep} it={it} gs={global_step}: {repr(e)}", flush=True)
+                traceback.print_exc()
+                raise
+
+            # (optional) force CUDA sync to catch async errors right away
+            if bool(cfg.get("debug", {}).get("sync_each_step", False)) and device_type == "cuda":
+                try:
+                    torch.cuda.synchronize()
+                except Exception as e:
+                    print(f"[fatal] cuda sync failed @ ep={ep} it={it} gs={global_step}: {repr(e)}", flush=True)
+                    traceback.print_exc()
+                    raise
 
             # スケジューラ & EMA
-            scheduler.step()
+            try:
+                scheduler.step()
+            except Exception as e:
+                print(f"[fatal] scheduler.step failed @ gs={global_step}: {repr(e)}", flush=True)
+                traceback.print_exc()
+                raise
             if ema is not None:
                 ema.update(model)
 
@@ -1147,7 +1551,6 @@ def train(cfg: Dict[str, Any]):
                 print(f"[debug] hit max_steps at gs={global_step} (cfg={max_steps}")
                 print(f"[train] Reached max_steps={max_steps} (global_step={global_step}). Stopping training.")
                 reached_max = True
-                # ここではbreakし、下の保存や評価へ
                 break
 
             # ===== 1エポック上限 =====
@@ -1164,16 +1567,25 @@ def train(cfg: Dict[str, Any]):
                 B, _, Ht_, Wt_ = probs.shape
                 flat = probs.view(B, -1)
 
+                # 画像右下パディング(0埋め)を分位しきい値の母集団から除外
+                # まずは入力解像度の valid を作り、特徴解像度(Ht_,Wt_)へ最近傍で downsample
+                valid_img = (images != 0).any(dim=1, keepdim=True).float()  # (B,1,H_in,W_in)
+                valid = F.interpolate(valid_img, size=(Ht_, Wt_), mode="nearest") > 0.5  # (B,1,Ht_,Wt_)
                 qs = [0.70, 0.80, 0.90]
                 iou_qs = {}
                 for q in qs:
-                    thr = torch.quantile(flat, q=q, dim=1, keepdim=True).view(B,1,1,1)
+                    # 画像ごとに valid 位置のみで分位を取る
+                    thrs = []
+                    for b in range(B):
+                        v = probs[b][valid[b]].view(-1)
+                        # valid が全0の非常事態は全体から計算（保険）
+                        if v.numel() == 0:
+                            v = probs[b].view(-1)
+                        thrs.append(torch.quantile(v, q=q).view(1,1,1))
+                    thr = torch.stack(thrs, dim=0)  # (B,1,1,1)
                     pred = (probs >= thr).float()
                     inter = (pred * gt).sum(dim=(2, 3))
-                    union = (pred + gt - pred * gt).sum(dim=(
-
-
-2, 3)) + 1e-6
+                    union = (pred + gt - pred * gt).sum(dim=(2, 3)) + 1e-6
                     iou_qs[f"iou_p{int(q*100)}"] = (inter / union).mean().item()
 
                 pred_05 = (probs >= 0.5).float()
@@ -1199,7 +1611,15 @@ def train(cfg: Dict[str, Any]):
                 neg_mean = float(probs[gt < 0.5].mean().item()) if (gt < 0.5).any() else float('nan')
 
             if it % log_interval == 0:
-                # 可視化
+                # 軽量メモリログ（大まかな把握）
+                if device_type == "cuda" and writer is not None:
+                    try:
+                        free, total = torch.cuda.mem_get_info()
+                        writer.add_scalar("sys/gpu_mem_free_mib", float(free/1024/1024), global_step)
+                        writer.add_scalar("sys/gpu_mem_total_mib", float(total/1024/1024), global_step)
+                    except Exception:
+                        pass
+                # 可視化保存（任意）
                 if cfg.get("train", {}).get("save_attn_vis", True) and (it % (log_interval * 2) == 0):
                     try:
                         import torchvision.utils as vutils
@@ -1209,6 +1629,7 @@ def train(cfg: Dict[str, Any]):
                         vutils.save_image(sm_hw.clamp(0, 1), os.path.join(vis_dir, "gt_mask.png"))
                     except Exception as e:
                         print("[warn] save_attn_vis failed:", repr(e))
+
                 avg_loss = running / log_interval
                 base_row = {
                     "epoch": ep, "iter": it, "global_step": global_step,
@@ -1227,30 +1648,34 @@ def train(cfg: Dict[str, Any]):
                 for k, v in iou_qs.items():
                     base_row[k] = round(float(v), 6)
 
-                writer.add_scalar("train/loss", float(avg_loss), global_step)
-                writer.add_scalar("train/sec_per_iter", float(iter_ema_sec or iter_sec), global_step)
-                writer.add_scalar("train/imgs_per_sec", float(iter_ema_ips or ips), global_step)
-                writer.add_scalar("train/eta_epoch_min", float(eta_epoch_sec/60.0), global_step)
-                writer.add_scalar("train/eta_total_min", float(eta_total_sec/60.0), global_step)
-                writer.add_scalar("train/attn", float(loss_attn_val.item()), global_step)
-                writer.add_scalar("train/box", float(loss_box_val.item()), global_step)
-                writer.add_scalar("train/iou@p70", float(iou_qs["iou_p70"]), global_step)
-                writer.add_scalar("train/iou@p80", float(iou_qs["iou_p80"]), global_step)
-                writer.add_scalar("train/iou@p90", float(iou_qs["iou_p90"]), global_step)
-                writer.add_scalar("train/iou@0.5", float(iou_05), global_step)
-                writer.add_scalar("train/iou@size", float(iou_sz), global_step)
-                try:
-                    writer.add_scalar("lr", float(scheduler.get_last_lr()[0]), global_step)
-                except Exception:
-                    writer.add_scalar("lr", float(optim.param_groups[0]["lr"]), global_step)
-                writer.add_scalar("train/gt_pos_ratio", float((sm_hw>0.5).float().mean().item()), global_step)
+                if writer is not None:
+                    writer.add_scalar("train/loss", float(avg_loss), global_step)
+                    writer.add_scalar("train/sec_per_iter", float(iter_ema_sec or (time.perf_counter() - iter_t0)), global_step)
+                    writer.add_scalar("train/imgs_per_sec", float(iter_ema_ips or 0.0), global_step)
+                    writer.add_scalar("train/attn", float(loss_attn_val.item()), global_step)
+                    writer.add_scalar("train/box", float(loss_box_val.item()), global_step)
+                    writer.add_scalar("train/iou@p70", float(iou_qs["iou_p70"]), global_step)
+                    writer.add_scalar("train/iou@p80", float(iou_qs["iou_p80"]), global_step)
+                    writer.add_scalar("train/iou@p90", float(iou_qs["iou_p90"]), global_step)
+                    writer.add_scalar("train/iou@0.5", float(iou_05), global_step)
+                    writer.add_scalar("train/iou@size", float(iou_sz), global_step)
+                    try:
+                        writer.add_scalar("lr", float(scheduler.get_last_lr()[0]), global_step)
+                    except Exception:
+                        writer.add_scalar("lr", float(optim.param_groups[0]["lr"]), global_step)
+                    writer.add_scalar("train/gt_pos_ratio", float((sm_hw>0.5).float().mean().item()), global_step)
+                    try:
+                        if (global_step % max(10, log_interval)) == 0:
+                            writer.flush()
+                    except Exception as e:
+                        print(f"[warn] writer.flush failed: {repr(e)}", flush=True)
 
                 row = {
                     **base_row,
-                    "sec_per_iter": round(float(iter_ema_sec or iter_sec), 6),
-                    "imgs_per_sec": round(float(iter_ema_ips or ips), 2),
-                    "eta_epoch_min": round(float(eta_epoch_sec/60.0), 2),
-                    "eta_total_min": round(float(eta_total_sec/60.0), 2),
+                    "sec_per_iter": round(float(iter_ema_sec or (time.perf_counter() - iter_t0)), 6),
+                    "imgs_per_sec": round(float(iter_ema_ips or 0.0), 2),
+                    "eta_epoch_min": None,
+                    "eta_total_min": None,
                 }
                 _csv_append(
                     train_csv, row,
@@ -1272,27 +1697,21 @@ def train(cfg: Dict[str, Any]):
                     except Exception:
                         cur_lr = optim.param_groups[0]["lr"]
                     print(f"{ep}\t{it}\t{global_step}\t"
-                          f"{avg_loss:.4f}\t{iou_05:.3f}\t{pos_mean:.3f}\t{neg_mean:.3f}\t{cur_lr:.2e}\t{(iter_ema_ips or ips):.2f}")
+                          f"{avg_loss:.4f}\t{iou_05:.3f}\t{pos_mean:.3f}\t{neg_mean:.3f}\t{cur_lr:.2e}\t{(iter_ema_ips or 0.0):.2f}")
+
 
             # ===== mid-epoch 保存（軽量） =====
             save_every_steps = int(cfg.get("save_every_steps", 0))
             if save_every_steps and (global_step % save_every_steps == 0):
-                light_state = {
-                    "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-                    "epoch": ep, "global_step": global_step
-                }
+                # 低メモリ版: CPUクローン巨大辞書を作らず、片方だけ保存
+                # No CPU clone; let torch.save stream tensors out directly
+                light_state = {"model": model.state_dict(), "epoch": ep, "global_step": global_step}
                 light_path = os.path.join(out_dir, "checkpoints", f"midstep_weights_{global_step}.pt")
                 try:
                     atomic_torch_save(light_state, light_path, use_legacy=False)
                 except Exception as e:
-                    print("[warn] mid-save zip failed, retry legacy:", repr(e))
+                    print("[warn] mid-save failed, retry legacy:", repr(e))
                     atomic_torch_save(light_state, light_path, use_legacy=True)
-                if atomic_safe_save is not None:
-                    st_path = os.path.join(out_dir, "checkpoints", f"midstep_weights_{global_step}.safetensors")
-                    try:
-                        atomic_safe_save({k: v.detach().cpu() for k, v in model.state_dict().items()}, st_path)
-                    except Exception as e:
-                        print("[warn] safetensors mid-save failed:", repr(e))
 
         # ========= VALIDATION/終了処理 =========
         if reached_max:
@@ -1301,12 +1720,24 @@ def train(cfg: Dict[str, Any]):
 
         if not skip_val:
             model.eval()
-            backup = {k: (v.detach().to("cpu", copy=True) if torch.is_tensor(v) else v) for k, v in model.state_dict().items()}
+            # 学習対象だけ軽量バックアップ（巨大LLM等を含めない）
+            backup_trainable = {n: p.detach().cpu().clone() for n, p in model.named_parameters() if p.requires_grad}
             torch.cuda.empty_cache()
 
             if ema is not None:
                 ema.copy_to(model)
             with torch.no_grad():
+                # ---- IoU 内部ログ設定 ----
+                evl_cfg = cfg.get("eval", {})
+                log_iou_internal = bool(evl_cfg.get("log_internal", False))
+                log_every = int(evl_cfg.get("log_every", 1))
+                log_sample_k = int(evl_cfg.get("sample_k", 2))
+                # オラクル閾値候補（軽めのスイープ）
+                oracle_thresholds = torch.linspace(0.05, 0.95, steps=19).tolist()
+                # 簡易AUC用の離散しきい値（粗目でOK）
+                auc_thresholds = torch.linspace(0.0, 1.0, steps=21).tolist()
+                # CSV 出力先
+                iou_debug_csv = os.path.join(log_dir, "val_iou_debug.csv")
                 total = 0.0
                 count = 0
                 iou_list, iou05_list, iou035_list, iou075_list = [], [], [], []
@@ -1319,12 +1750,14 @@ def train(cfg: Dict[str, Any]):
                 img_count = 0
 
                 once = True
-                for batch in dl_va:
+                for bidx, batch in enumerate(dl_va, start=1):
+                    _should_log_this_batch = log_iou_internal and ((bidx % max(1, log_every)) == 0)
                     images = batch.get("image", batch.get("images")).to(device, non_blocking=True)
                     soft   = batch["soft_mask"].to(device, dtype=torch.float32)
 
                     out = model({"image": images, "text": _ensure_list_text(batch.get("text"), images.size(0))}, compute_lm=False)
 
+                    # --- logits / probs を必ず用意する ---
                     if "attn_logits" in out and out["attn_logits"] is not None and out["attn_logits"].ndim == 4:
                         A_logit_hw = torch.nan_to_num(out["attn_logits"], nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
                         Ht, Wt = A_logit_hw.shape[-2:]
@@ -1332,12 +1765,25 @@ def train(cfg: Dict[str, Any]):
                         A_prob_hw = torch.nan_to_num(out["attn_maps"], nan=0.0, posinf=1.0, neginf=0.0).clamp(1e-6, 1-1e-6)
                         Ht, Wt = A_prob_hw.shape[-2:]
                         A_logit_hw = torch.logit(A_prob_hw)
-                        sm_hw = _mask_to_feat_hw(soft, (Ht, Wt))
-                        probs = torch.sigmoid(A_logit_hw).to(torch.float32)
-                        gt    = sm_hw.to(torch.float32)
-                        B = probs.size(0)
-                        img_count += B
-                        flat = probs.view(B, -1)
+                    # --- 検証側もトレーニングと同様に反転 ---
+                    if invert_attn:
+                        A_logit_hw = -A_logit_hw
+                    # 共通化（どちらの分岐でもここに来る）
+                    # === （追加）温度スケーリング（評価時のみ・既定 T=0.85） ===
+                    try:
+                        if eval_temp and eval_temp > 0 and abs(eval_temp - 1.0) > 1e-6:
+                            A_logit_hw = _apply_temperature_to_logits(A_logit_hw, T=eval_temp)
+                    except Exception:
+                        pass
+                    sm_hw = _mask_to_feat_hw(soft, (Ht, Wt))
+                    probs = torch.sigmoid(A_logit_hw).to(torch.float32)
+                    gt    = sm_hw.to(torch.float32)
+                    B     = probs.size(0)
+                    # valid（パディング除外マスク）
+                    valid_img = (images != 0).any(dim=1, keepdim=True).float()
+                    valid = F.interpolate(valid_img, size=(Ht, Wt), mode="nearest") > 0.5
+                    img_count += B
+                    flat  = probs.view(B, -1)
 
                     prob_sum += float(probs.mean().item()) * B
                     pos_mask = (gt >= 0.5)
@@ -1350,31 +1796,127 @@ def train(cfg: Dict[str, Any]):
                     if nv.numel() > 0:
                         prob_neg_sum += float(nv.mean().item()) * nv.numel()
                         pix_neg += nv.numel()
-                    p = eval_q1
-                    thr_q = torch.quantile(flat, q=p, dim=1).view(B, 1, 1, 1)
-                    pred_q = (probs >= thr_q).float()
 
-                    def _soft_iou(pred, gt):
-                        inter = (pred * gt).sum((2, 3))
-                        union = (pred + gt - pred * gt).sum((2, 3)) + 1e-6
+                    # --- 画像ごとの分位しきい値で二値化（quantile_p を使用）---
+                    p = float(cfg.get("eval", {}).get("quantile_p", 0.5))
+                    p = min(0.9999, max(0.0001, p))
+
+                    thrs = []
+                    # デバッグ蓄積
+                    dbg_thr_vals, dbg_pred_area, dbg_gt_area, dbg_valid_ratio = [], [], [], []
+                    for b in range(B):
+                        v = probs[b][valid[b]].view(-1)
+                        if v.numel() == 0:
+                            v = probs[b].view(-1)
+                        th_val = torch.quantile(v, q=p)
+                        thrs.append(th_val.view(1,1,1))
+                        if _should_log_this_batch and b < log_sample_k:
+                            # 面積（valid内の割合）
+                            dbg_thr_vals.append(float(th_val.item()))
+                            dbg_valid_ratio.append(float(valid[b].float().mean().item()))
+                            dbg_pred_area.append(float((probs[b] >= th_val).float()[valid[b]].float().mean().item()))
+                            dbg_gt_area.append(float((gt[b] >= 0.5).float()[valid[b]].float().mean().item()))
+                    thr = torch.stack(thrs, dim=0)  # (B,1,1,1)
+                    pred_q = (probs >= thr).float()
+
+                    # === （追加）小領域除去（面積割合でフィルタ）===
+                    try:
+                        if eval_min_comp and eval_min_comp > 0:
+                            pred_q = _remove_small_components_bool(pred_q.bool(), min_area_ratio=eval_min_comp).float()
+                    except Exception:
+                        pass
+ 
+                    def _soft_iou(pred, gt, vmask=None):
+                        if vmask is None:
+                            vmask = torch.ones_like(pred, dtype=pred.dtype, device=pred.device)
+                        inter = (pred * gt * vmask).sum((2, 3))
+                        union = ((pred + gt - pred * gt) * vmask).sum((2, 3)) + 1e-6
                         return (inter / union).mean().item()
 
                     pred_05   = (probs >= 0.5).float()
                     pred_035  = (probs >= 0.35).float()
                     pred_075  = (probs >= 0.75).float()
+                    # 各しきい値マスクにも小領域除去を適用
+                    try:
+                        if eval_min_comp and eval_min_comp > 0:
+                            pred_05  = _remove_small_components_bool(pred_05.bool(),  min_area_ratio=eval_min_comp).float()
+                            pred_035 = _remove_small_components_bool(pred_035.bool(), min_area_ratio=eval_min_comp).float()
+                            pred_075 = _remove_small_components_bool(pred_075.bool(), min_area_ratio=eval_min_comp).float()
+                    except Exception:
+                        pass
 
-                    iou_q     = _soft_iou(pred_q, gt)
-                    iou_05    = _soft_iou(pred_05, gt)
-                    iou_035   = _soft_iou(pred_035, gt)
-                    iou_075   = _soft_iou(pred_075, gt)
+                    iou_q     = _soft_iou(pred_q,   gt, valid)
+                    iou_05    = _soft_iou(pred_05,  gt, valid)
+                    iou_035   = _soft_iou(pred_035, gt, valid)
+                    iou_075   = _soft_iou(pred_075, gt, valid)
 
                     iou_list.append(iou_q)
                     iou05_list.append(iou_05)
                     iou035_list.append(iou_035)
                     iou075_list.append(iou_075)
 
+                    # ===== 追加: オラクル閾値 IoU と ピクセルAUC（valid内）=====
+                    oracle_iou_batch = []
+                    auc_batch = []
+                    for b in range(B):
+                        vmask = valid[b]
+                        gtb = (gt[b] >= 0.5).float()
+                        pb  = probs[b]
+                        # --- Oracle IoU: 複数しきい値を総当たりして最大IoU ---
+                        best_iou = 0.0
+                        for t in oracle_thresholds:
+                            predb = (pb >= t).float()
+                            inter = (predb * gtb * vmask).sum().item()
+                            uni   = ((predb + gtb - predb * gtb) * vmask).sum().item()
+                            if uni > 0:
+                                best_iou = max(best_iou, inter / uni)
+                        oracle_iou_batch.append(best_iou)
+                        # --- Pixel AUC（離散しきい値でのTPR/FPRを台形則で近似）---
+                        # 有効画素のみ
+                        pos = pb[(gtb > 0.5) & vmask]
+                        neg = pb[(gtb < 0.5) & vmask]
+                        if pos.numel() == 0 or neg.numel() == 0:
+                            auc_batch.append(float('nan'))
+                        else:
+                            TPR, FPR = [], []
+                            for t in auc_thresholds:
+                                tp = (pos >= t).float().mean().item()
+                                fp = (neg >= t).float().mean().item()
+                                TPR.append(tp); FPR.append(fp)
+                            # FPR昇順に並べて台形則
+                            pairs = sorted(zip(FPR, TPR))
+                            area = 0.0
+                            for i in range(1, len(pairs)):
+                                x0,y0 = pairs[i-1]; x1,y1 = pairs[i]
+                                area += (x1 - x0) * (y0 + y1) * 0.5
+                            auc_batch.append(max(0.0, min(1.0, area)))
+
+                    # 代表統計（バッチ平均）を TensorBoard
+                    if writer is not None:
+                        try:
+                            writer.add_scalar("val_debug/oracle_iou_mean", float(np.nanmean(oracle_iou_batch)), ep)
+                            writer.add_scalar("val_debug/pixel_auc_mean",  float(np.nanmean(auc_batch)), ep)
+                        except Exception:
+                            pass
+
+                    # サンプル毎の詳細CSV出力（log_internal時のみ）
+                    if _should_log_this_batch:
+                        for b in range(min(B, log_sample_k)):
+                            _csv_append(
+                                iou_debug_csv,
+                                {
+                                    "epoch": ep, "batch": bidx, "sample": b,
+                                    "oracle_iou": round(float(oracle_iou_batch[b]), 6),
+                                    "pixel_auc": round(float(auc_batch[b]), 6),
+                                },
+                                field_order=["epoch","batch","sample","oracle_iou","pixel_auc"]
+                            )
                     dicebce = safe_dice_from_probs(probs, gt) + 0.5 * safe_bce_from_probs(probs, gt)
-                    loss_attn_val = nn.BCEWithLogitsLoss(reduction="mean")(A_logit_hw, gt)
+                    # 検証も学習と同じ “スカラー” pos_weight で BCE を計算
+                    with torch.no_grad():
+                        pos_frac = gt.mean().clamp(1e-6, 1-1e-6)  # scalar
+                        pos_w    = ((1.0 - pos_frac) / pos_frac).clamp(1.0, 20.0)
+                    loss_attn_val = F.binary_cross_entropy_with_logits(A_logit_hw, gt, reduction="mean", pos_weight=pos_w)
                     total += (lw.get("attn", 0.5) * loss_attn_val.item() + (cfg.get("box_target_weight", 1.0)) * dicebce.item())
                     count += 1
 
@@ -1391,7 +1933,13 @@ def train(cfg: Dict[str, Any]):
                 val_iou_035 = float(np.mean(iou035_list)) if len(iou035_list) > 0 else 0.0
                 val_iou_075 = float(np.mean(iou075_list)) if len(iou075_list) > 0 else 0.0
 
-            model.load_state_dict(backup)
+            # 退避した学習対象パラメータのみ元に戻す
+            with torch.no_grad():
+                for n, p in model.named_parameters():
+                    if p.requires_grad and n in backup_trainable:
+                        p.data.copy_(backup_trainable[n].to(device=p.device, dtype=p.dtype))
+            del backup_trainable
+            torch.cuda.empty_cache()
 
             dt = time.time() - t0
             epoch_ips = float(iter_ema_ips or 0.0)
@@ -1414,52 +1962,64 @@ def train(cfg: Dict[str, Any]):
                 "imgs_per_sec_ema": None,
                 "sec_per_iter_ema": None,
             }
-            writer.add_scalar("val/loss", float(val_loss), ep)
-            writer.add_scalar("val/iou@p(cur)", float(val_iou_q), ep)
-            writer.add_scalar("val/iou@0.35", float(val_iou_035), ep)
-            writer.add_scalar("val/iou@0.5", float(val_iou_05), ep)
-            writer.add_scalar("val/iou@0.75", float(val_iou_075), ep)
-            writer.add_scalar("val/prob_mean", float(prob_sum / max(1, img_count)), ep)
-            if pix_pos > 0:
-                writer.add_scalar("val/prob_pos_mean", float(prob_pos_sum / pix_pos), ep)
-            if pix_neg > 0:
-                writer.add_scalar("val/prob_neg_mean", float(prob_neg_sum / pix_neg), ep)
-            try: writer.flush()
-            except Exception: pass
+            if writer is not None:
+                writer.add_scalar("val/loss", float(val_loss), ep)
+                writer.add_scalar("val/iou@p(cur)", float(val_iou_q), ep)
+                writer.add_scalar("val/iou@0.35", float(val_iou_035), ep)
+                writer.add_scalar("val/iou@0.5", float(val_iou_05), ep)
+                writer.add_scalar("val/iou@0.75", float(val_iou_075), ep)
+                # デバッグの代表統計（閾値・面積）
+                try:
+                    # 代表値をログ（全バッチ平均を近似：直近の分を代理）
+                    if 'thr' in locals():
+                        writer.add_scalar("val_debug/threshold_mean", float(thr.mean().item()), ep)
+                    writer.add_scalar("val_debug/pred_area_mean", float((probs >= 0.5).float().mean().item()), ep)
+                    writer.add_scalar("val_debug/gt_area_mean", float((gt >= 0.5).float().mean().item()), ep)
+                    writer.add_scalar("val_debug/valid_ratio_mean", float(valid.float().mean().item()), ep)
+                except Exception:
+                    pass
+                writer.add_scalar("val/prob_mean", float(prob_sum / max(1, img_count)), ep)
+                if pix_pos > 0:
+                    writer.add_scalar("val/prob_pos_mean", float(prob_pos_sum / pix_pos), ep)
+                if pix_neg > 0:
+                    writer.add_scalar("val/prob_neg_mean", float(prob_neg_sum / pix_neg), ep)
+                try: writer.flush()
+                except Exception: pass
 
             _csv_append(epoch_csv, epoch_row, field_order=["epoch","val_loss","val_iou_p","val_iou_035","val_iou_05","val_iou_075","elapsed_sec","imgs_per_sec_ema","sec_per_iter_ema"])
             _jsonl_append(epoch_jsonl, {**epoch_row,
-                                        "quantile_p": cfg.get("eval", {}).get("quantile_p", 0.85),
-                                        "quantile_p0": cfg.get("eval", {}).get("quantile_p0", 0.90)})
-            # 早期停止
+                                        "quantile_p": float(cfg.get("eval", {}).get("quantile_p", 0.5)),
+                                        "quantile_p0": float(cfg.get("eval", {}).get("quantile_p0", 0.90))})
+            # 早期停止（min_delta / mode 対応）
             score = val_iou_05 if early_metric == "val_iou_05" else val_iou_q
-            if score > early_best:
-                early_best, early_wait = score, 0
+            if early_mode == "min":
+                improved = (score < (early_best - early_min_delta))
+            else:
+                improved = (score > (early_best + early_min_delta))
+            if improved:
+                early_best = score
+                early_wait = 0
+                print(f"[early-stop] new best {early_metric}={score:.4f} (min_delta={early_min_delta}, mode={early_mode})")
             else:
                 early_wait += 1
+                print(f"[early-stop] no improvement ({early_wait}/{early_patience}) "
+                      f"best={early_best:.4f} cur={score:.4f} (min_delta={early_min_delta}, mode={early_mode})")
             if early_patience > 0 and early_wait >= early_patience:
-                print(f"[early-stop] no improvement on {early_metric} for {early_patience} epochs.")
+                print(f"[early-stop] stop: no improvement on {early_metric} for {early_patience} epochs "
+                      f"(best={early_best:.4f}).")
                 reached_max = True  # 保存後に抜ける
         # ========== 保存（軽量→フル） ==========
         if ema is not None:
             ema.copy_to(model)
-        light_sd = {
-            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-            "cfg": cfg, "epoch": ep
-        }
+        # 低メモリ版: 片方だけ保存（ここでは .pt）
+        light_sd = {"model": model.state_dict(), "cfg": cfg, "epoch": ep}
         light_path = os.path.join(out_dir, "checkpoints", f"weights_ep{ep}.pt")
         try:
             atomic_torch_save(light_sd, light_path, use_legacy=False)
         except Exception as e:
-            print("[warn] light save zip failed, retry legacy:", repr(e))
+            print("[warn] light save failed, retry legacy:", repr(e))
             atomic_torch_save(light_sd, light_path, use_legacy=True)
-        if atomic_safe_save is not None:
-            st_path = os.path.join(out_dir, "checkpoints", f"weights_ep{ep}.safetensors")
-            try:
-                atomic_safe_save({k: v.detach().cpu() for k, v in model.state_dict().items()}, st_path)
-            except Exception as e:
-                print("[warn] safetensors light save failed:", repr(e))
-        # フル
+        # フルチェックポイントも .pt のみにし、二重保存をやめてメモリ圧を下げる
         full_ckpt = {
             "model": model.state_dict(),
             "optimizer": optim.state_dict(),
@@ -1474,21 +2034,25 @@ def train(cfg: Dict[str, Any]):
         try:
             atomic_torch_save(full_ckpt, full_path, use_legacy=False)
         except Exception as e:
-            print("[warn] full save zip failed, retry legacy:", repr(e))
+            print("[warn] full save failed, retry legacy:", repr(e))
             atomic_torch_save(full_ckpt, full_path, use_legacy=True)
-        if max_steps > 0 and reached_max:
-            print(f"[train] Training stopped after reaching max_steps={max_steps}. Final epoch: {ep}")
+        # 早期停止 or max_steps で終了
+        if reached_max:
+            print(f"[train] Training stopped by early-stop/max-steps. Final epoch: {ep}")
             break
 
         # 元重みへ戻す
         # skip_val のときは backup を作っていないので存在チェック
         if 'backup' in locals():
             model.load_state_dict(backup)
-    writer.close()
+
+    if writer is not None:
+        writer.close()
     # ---- total wall time ----
     total_wall = time.perf_counter() - wall0
     hh = int(total_wall // 3600); mm = int((total_wall % 3600) // 60); ss = int(total_wall % 60)
     print(f"[train] total wall time: {hh:02d}:{mm:02d}:{ss:02d}  ({total_wall:.1f}s)")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", type=str, required=True, help="yaml config")

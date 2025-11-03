@@ -20,7 +20,6 @@ jobs:
         with:
           submodules: true
           fetch-depth: 0
-          # public submodulesならtoken不要だが、明示すると安定することがある
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Init submodules (robust)
@@ -62,7 +61,7 @@ jobs:
   gpu_smoke:
     name: Smoke (GPU, self-hosted)
     runs-on: [ self-hosted, gpu ]
-    if: false   # 一旦無効化してグリーンを優先。Runner準備後に true に戻す
+    if: false   # Runner 準備できたら true に戻す or 行を削除
     needs: lint_and_unit_cpu
     steps:
       - name: Checkout

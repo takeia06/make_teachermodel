@@ -1,0 +1,9 @@
+{
+  "color": { "white": ["whitish","light gray"], "black": ["dark","blackish"], "red": ["reddish","scarlet"] },
+  "shape": { "chip": ["chipping","missing piece"], "line scratch": ["thin scratch","long narrow scratch"] },
+  "texture": { "dullness": ["matte","loss of gloss"], "rough": ["coarse","uneven"] },
+  "position": { "neck": ["neck area","upper center"], "rim": ["edge","border"], "left edge": ["left side edge"] },
+  "size": { "small": ["tiny","dot-like"], "medium": ["moderate"], "large": ["wide","broad"] },
+  "parts": { "screw": ["bolt","fastener"], "bottle mouth": ["bottle neck","opening"] },
+  "defects": { "scratch": ["surface scratch","abrasion"], "dent": ["depression"], "chip": ["missing","chipping"] }
+}

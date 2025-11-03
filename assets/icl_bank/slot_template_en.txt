@@ -1,0 +1,8 @@
+Part: {part}
+Defect: {defect}
+Color: {color}
+Shape: {shape}
+Texture: {texture}
+Position & Size: {position_size}
+
+Instruction: Identify the region corresponding to the {defect} above and return the bbox.

@@ -1,0 +1,8 @@
+[submodule "mmdetection"]
+	path = mmdetection
+	url = https://github.com/open-mmlab/mmdetection.git
+	branch = main
+[submodule "code/GroundingDINO"]
+	path = code/GroundingDINO
+	url = https://github.com/IDEA-Research/GroundingDINO.git
+	branch = main

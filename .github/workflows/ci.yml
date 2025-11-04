@@ -51,8 +51,8 @@ jobs:
 
       - name: Lint (ruff + black --check)
         run: |
-          ruff check .
-          black --check .
+          ruff check code tools tests
+          black --check code tools tests
 
       - name: Unit tests (CPU only; fast)
         run: |
